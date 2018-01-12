@@ -1,0 +1,6 @@
+[submodule "CISharedResources_QT5"]
+	path = CISharedResources_QT5
+	url = //wpitdrr/scripts/script files/python/CISharedResources_QT5
+[submodule "ComputerInfoSharedResources"]
+	path = ComputerInfoSharedResources
+	url = https://github.com/mjanos/ComputerInfoSharedResources.git

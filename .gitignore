@@ -1,0 +1,6 @@
+__pycache__
+*.xlsx
+build
+dist
+multi_comp_settings_WPH.cfg
+setup-cli.py
