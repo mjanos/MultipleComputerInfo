@@ -1,4 +1,4 @@
-ComputerInfoSharedResourcesimport sys
+import sys
 import os
 import threading
 import time
