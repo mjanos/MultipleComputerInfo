@@ -20,7 +20,6 @@ from ComputerInfoSharedResources.CIProgram import ProgramChoices
 from ComputerInfoSharedResources.CITime import format_time
 from ComputerInfoSharedResources.CIStorage import ThreadSafeCounter, ThreadSafeBool
 from ComputerInfoSharedResources.CIWMI import ComputerInfo, WMIThread
-from ComputerInfoSharedResources.CIPathFixes import exe_path
 import argparse
 from urllib import request
 
@@ -1314,15 +1313,17 @@ if __name__ == '__main__':
 
     ico_path = ""
     try:
-        appdata = os.getenv("APPDATA")
-        ico_dir = exe_path(__file__)
+        if hasattr(sys,'frozen'):
+            ico_path = sys.executable
+        else:
+            ico_path = sys.argv[0]
 
-        if not os.path.exists(appdata + '\\Computer Info'):
+        if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info'):
             os.makedirs(appdata + '\\Computer Info')
-        if not os.path.exists(appdata + '\\Computer Info\\multi_comp_settings.cfg'):
-            copyfile(ico_dir + '\\multi_comp_settings.cfg',appdata + '\\Computer Info\\multi_comp_settings.cfg')
+        if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg'):
+            copyfile(os.path.dirname(ico_path) + '\\multi_comp_settings.cfg',os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg')
         if not os.path.exists(appdata + '\\Computer Info\\other_applications.prg'):
-            copyfile(ico_dir + '\\other_applications.prg',appdata + '\\Computer Info\\other_applications.prg')
+            copyfile(os.path.dirname(ico_path) + '\\other_applications.prg',os.getenv("APPDATA") + '\\Computer Info\\other_applications.prg')
     except Exception as e: print(e)
 
     wind = QApplication(sys.argv)
