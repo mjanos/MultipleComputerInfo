@@ -1319,10 +1319,10 @@ if __name__ == '__main__':
             ico_path = sys.argv[0]
 
         if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info'):
-            os.makedirs(appdata + '\\Computer Info')
+            os.makedirs(os.getenv("APPDATA") + '\\Computer Info')
         if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg'):
             copyfile(os.path.dirname(ico_path) + '\\multi_comp_settings.cfg',os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg')
-        if not os.path.exists(appdata + '\\Computer Info\\other_applications.prg'):
+        if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info\\other_applications.prg'):
             copyfile(os.path.dirname(ico_path) + '\\other_applications.prg',os.getenv("APPDATA") + '\\Computer Info\\other_applications.prg')
     except Exception as e: print(e)
 
