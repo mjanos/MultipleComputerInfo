@@ -84,7 +84,6 @@ class App(QMainWindow):
 
         self.full_debug_log = []
         self.running = False
-        #self.hide_unavailable = False
         self.cancel_bool = ThreadSafeBool()
         self.filling_done_bool = ThreadSafeBool()
         self.debug = debug
@@ -229,21 +228,26 @@ class App(QMainWindow):
         self.table_hide_btn.clicked.connect(self.restore_input_box)
         self.table_save_btn.clicked.connect(self.save_excel)
 
-        self.table_unavailable_btn = QCheckBox("Hide 'Unavailable'",self.table_frame)
-        self.table_unavailable_btn.stateChanged.connect(self.setRowsHidden)
-
         self.table_frame.setLayout(self.table_layout)
         self.table_layout.addWidget(self.table_tabs)
 
         self.table_btn_layout.addWidget(self.table_hide_btn)
         self.table_btn_layout.addWidget(self.table_save_btn)
-        self.table_btn_layout.addWidget(self.table_unavailable_btn)
         self.table_layout.addLayout(self.table_btn_layout)
 
         self.table_frame.hide()
 
         self.run_button = QPushButton('Start',self.col_one)
         self.run_button.clicked.connect(self.start_scan)
+        self.run_button.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Minimum)
+
+        self.table_unavailable_btn = QCheckBox("Hide 'Unavailable'",self.col_one)
+        self.table_unavailable_btn.stateChanged.connect(self.setRowsHidden)
+        self.table_unavailable_btn.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.Minimum)
+
+        self.start_layout = QHBoxLayout()
+        self.start_layout.addWidget(self.run_button)
+        self.start_layout.addWidget(self.table_unavailable_btn)
 
         self.running_frame = QWidget()
         self.running_frame.setContentsMargins(0,0,0,0)
@@ -259,7 +263,8 @@ class App(QMainWindow):
 
         self.col_one_layout.addWidget(self.title_label)
         self.col_one_layout.addWidget(self.inbox)
-        self.col_one_layout.addWidget(self.run_button)
+        self.col_one_layout.addLayout(self.start_layout)
+        # self.col_one_layout.addWidget(self.table_unavailable_btn)
         self.col_one_layout.addWidget(self.running_frame)
         self.title_label.setAlignment(Qt.AlignCenter)
 
@@ -357,6 +362,7 @@ class App(QMainWindow):
             self.run_button.setEnabled(False)
             self.inbox.setEnabled(False)
             self.optionsmenu.setEnabled(False)
+            self.table_unavailable_btn.setEnabled(False)
             self.check_form.form_disable()
             self.shortcut_file_form.form_disable()
             self.apps_form.form_disable()
@@ -399,6 +405,7 @@ class App(QMainWindow):
             self.run_button.setEnabled(True)
             self.inbox.setEnabled(True)
             self.optionsmenu.setEnabled(True)
+            self.table_unavailable_btn.setEnabled(True)
             self.check_form.form_enable()
             self.shortcut_file_form.form_enable()
             self.apps_form.form_enable()
@@ -642,6 +649,7 @@ class App(QMainWindow):
                 self.table_row_printer_count += 1
             table.resizeColumnsToContents()
 
+
         add_items(self.table1,self.main_columns,temp_dict)
         try:
             add_items(self.shortcuts_table,self.icon_columns,temp_icon_dict,color_scheme=[('Done',"#98FB98")])
@@ -671,6 +679,27 @@ class App(QMainWindow):
             add_items(self.find_apps_installs_table,self.exes_columns,temp_checkbox_exes_dict,color_scheme=[('Success',"#98FB98"),('Already Installed',"#F0F8FF")])
         except AttributeError:pass
         except Exception as e: debug_print(self.debug,e)
+
+        if self.table_unavailable_btn.isChecked() and self.table1.item(row,0).text().lower().strip() == "unavailable":
+            self.table1.setRowHidden(row,True)
+
+            if self.shortcuts_table.rowCount():
+                self.shortcuts_table.setRowHidden(row,True)
+
+            if self.scanners_table.rowCount():
+                self.scanners_table.setRowHidden(row,True)
+
+            if self.monitors_table.rowCount():
+                self.monitors_table.setRowHidden(row,True)
+
+            if self.install_apps_table.rowCount():
+                self.install_apps_table.setRowHidden(row,True)
+
+            if self.find_apps_table.rowCount():
+                self.find_apps_table.setRowHidden(row,True)
+
+            if self.find_apps_installs_table.rowCount():
+                self.find_apps_installs_table.setRowHidden(row,True)
 
     """
     Generates a window with the output of a vbs installer.
@@ -752,7 +781,6 @@ class App(QMainWindow):
             top.show()
             top.activateWindow()
         except:pass
-
 
     """
     Activated by pressing start button. Creates a GUIThreadClass Object with all necessary options.
@@ -909,13 +937,12 @@ class App(QMainWindow):
             temp_printers_dict = {}
             try:
                 if self.cancel_bool.get():
-                    timeout = 1
+                    timeout = 0
 
                 item = q.get(timeout=timeout)
                 self.comp_obj_complete[item.count] = item
 
                 if item:
-                    verbose_print(self.verbose,"Got %s" % (item.input_name))
                     self.running_threads.decrement()
                 self.workbook.set_working_sheet(self.computers_key)
                 if not item.status:
@@ -1049,7 +1076,6 @@ class App(QMainWindow):
                             self.workbook.working_sheet.add_row(temp_checkbox_exes_dict,row=item.count+2)
 
                 else:
-                    verbose_print(self.verbose,"making unavailable")
                     if self.cancel_bool.get():
                         temp_dict = {'status':"Cancelled",'name':item.input_name,'error':"Cancelled"}
                         try:
@@ -1114,10 +1140,7 @@ class App(QMainWindow):
                 debug_print(self.debug,"++++")
                 try:
                     self.workbook.set_working_sheet(self.computers_key)
-                    if self.cancel_bool.get():
-                        temp_dict = {'status':"Cancelled",'name':item.input_name,'error':"Cancelled"}
-                    else:
-                        temp_dict = {'status':"Unavailable",'name':item.input_name,'error':item.status}
+                    temp_dict = {'status':"Unavailable",'name':item.input_name,'error':item.status}
                     self.workbook.working_sheet.add_row(temp_dict,row=item.count+2)
                     if icon:
                         self.workbook.set_or_create_worksheet("Icon Push",columns=self.icon_columns)
@@ -1127,6 +1150,7 @@ class App(QMainWindow):
                 self.countdown.decrement()
                 prog_callback.emit(self.countdown.get(),self.count.get())
                 if item:
+
                     summary_dict.emit(
                                     item.count,
                                     temp_dict,
@@ -1139,6 +1163,7 @@ class App(QMainWindow):
                                     temp_checkbox_exes_dict,
                                     )
                     self.full_debug_log.append({'name':item.input_name,'serial':item.serial,'debug':item.debug_log})
+
         complete_run.emit()
 
     """
@@ -1194,7 +1219,10 @@ class App(QMainWindow):
 
         for r in range(1,self.table1.rowCount()+1):
             if self.table1.item(r,0) and self.table1.item(r,0).text() == "Queued":
-                self.table1.item(r,0).setText("Queue Timeout")
+                if self.cancel_bool:
+                    self.table1.item(r,0).setText("Cancelled")
+                else:
+                    self.table1.item(r,0).setText("Queue Timeout")
         self.table1.resizeColumnsToContents()
 
     """
@@ -1282,7 +1310,6 @@ class App(QMainWindow):
                 discard_sheet = QMessageBox.question(self,"Save Excel", "Discard Spreadsheet?")
                 if discard_sheet == QMessageBox.Yes:
                      done_save = True
-                     self.workbook = None
             else:
                 try:
                     done_save = True
