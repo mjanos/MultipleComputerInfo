@@ -20,6 +20,7 @@ from ComputerInfoSharedResources.CIProgram import ProgramChoices
 from ComputerInfoSharedResources.CITime import format_time
 from ComputerInfoSharedResources.CIStorage import ThreadSafeCounter, ThreadSafeBool
 from ComputerInfoSharedResources.CIWMI import ComputerInfo, WMIThread
+from ComputerInfoSharedResources.CICustomWidgets import CustomScrollBox
 import argparse
 from urllib import request
 
@@ -188,6 +189,7 @@ class App(QMainWindow):
         self.setCentralWidget(self.containerWidget)
 
         self.col_one = QWidget(self)
+        self.col_one.setMinimumSize(400,500)
         self.col_one_layout = QVBoxLayout()
         self.col_one.setLayout(self.col_one_layout)
         self.title_label = QLabel("Input a list of computers to get details",self.col_one)
@@ -279,7 +281,9 @@ class App(QMainWindow):
         self.push_shortcut_tab_layout.setAlignment(Qt.AlignTop)
         self.push_shortcut_tab.setLayout(self.push_shortcut_tab_layout)
 
-        self.find_apps_tab = QWidget()
+        self.find_apps_tab = CustomScrollBox()
+        self.find_apps_tab.setWidgetResizable(True)
+        self.find_apps_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.find_apps_tab_layout = QVBoxLayout()
         self.find_apps_tab_layout.setAlignment(Qt.AlignTop)
         self.find_apps_tab.setLayout(self.find_apps_tab_layout)
@@ -298,10 +302,13 @@ class App(QMainWindow):
         self.push_shortcut_tab_layout.addWidget(self.shortcut_file_form)
 
         self.apps_form = AppsForm(programs_obj=self.other_applications)
-        self.find_apps_tab_layout.addWidget(self.apps_form)
+        #self.find_apps_tab_layout.addWidget(self.apps_form)
+        self.find_apps_tab.setWidget(self.apps_form)
 
         self.app_file_form = FileForm(extensionsallowed="VB Files (*.vbs)",title="Choose Script File")
         self.install_app_tab_layout.addWidget(self.app_file_form)
+
+        #self.resize(self.width(),self.height()+200)
 
         self.show()
         self.innerframe.show()
