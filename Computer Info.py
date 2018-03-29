@@ -305,7 +305,7 @@ class App(QMainWindow):
         #self.find_apps_tab_layout.addWidget(self.apps_form)
         self.find_apps_tab.setWidget(self.apps_form)
 
-        self.app_file_form = FileForm(extensionsallowed="VB Files (*.vbs)",title="Choose Script File")
+        self.app_file_form = FileForm(extensionsallowed="VBScript, Powershell Script, Python Script (*.vbs *.ps1 *.py)",title="Choose Script File")
         self.install_app_tab_layout.addWidget(self.app_file_form)
 
         #self.resize(self.width(),self.height()+200)
