@@ -9,7 +9,7 @@ import traceback
 import ctypes
 from shutil import copyfile
 from collections import OrderedDict
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QAction, QLabel, QBoxLayout, QVBoxLayout, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QProgressBar, QTabWidget, QFileDialog, QMessageBox, QScrollArea, QStatusBar, QDialog, QTableWidget, QTableWidgetItem, QSplitter, QSizePolicy, QMenu, QCheckBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QAction, QLabel, QFormLayout,QBoxLayout, QVBoxLayout, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QProgressBar, QTabWidget, QFileDialog, QMessageBox, QScrollArea, QStatusBar, QDialog, QTableWidget, QTableWidgetItem, QSplitter, QSizePolicy, QMenu, QCheckBox
 from PyQt5.QtGui import QFont, QBrush, QColor,QCursor
 from PyQt5.QtCore import *
 from ComputerInfoSharedResources.CIForms import ShortcutCheckboxForm, AuthenticationForm, FileForm, AppsForm
@@ -94,6 +94,8 @@ class App(QMainWindow):
         self.comp_obj_complete = {}
         self.excel_row_printer_count = 0
         self.table_row_printer_count = 0
+        self.custom_user = ""
+        self.custom_passwd = ""
 
         #widgets
         self.innerframe = QTabWidget(parent=self)
@@ -119,6 +121,36 @@ class App(QMainWindow):
         top.show()
         top.activateWindow()
 
+    def set_cred_vars(self,user,passwd,top):
+        self.custom_user=user.text()
+        if self.custom_user:
+            self.custom_passwd=passwd.text()
+            self.setWindowTitle("Computer Info (User: python %s)" % self.custom_user)
+        else:
+            self.setWindowTitle("Computer Info")
+        top.close()
+        
+    def set_credentials(self):
+        top = QDialog(self)
+        top.setWindowTitle("Enter Credentials")
+        top.setSizeGripEnabled(True)
+        top_layout = QVBoxLayout()
+        top.setLayout(top_layout)
+        settings_form = QFormLayout()
+        usernamefield=QLineEdit(self.custom_user)
+        passwordfield=QLineEdit(self.custom_passwd)
+        passwordfield.setEchoMode(QLineEdit.Password)
+        submitbtn = QPushButton("Submit")
+        settings_form.addRow("Username",usernamefield)
+        settings_form.addRow("Password",passwordfield)
+        settings_form.addRow(submitbtn)
+        submitbtn.clicked.connect(lambda:self.set_cred_vars(usernamefield,passwordfield,top))
+        
+        top_layout.addLayout(settings_form)
+        top_layout.setAlignment(settings_form, Qt.AlignTop)
+        top.show()
+        top.activateWindow()
+
     def create_main_widgets(self):
         self.setWindowTitle("Computer Info")
         self.mainmenu = self.menuBar()
@@ -126,6 +158,10 @@ class App(QMainWindow):
         self.optionsmenu = self.mainmenu.addMenu('Edit')
         self.helpmenu = self.mainmenu.addMenu('Help')
 
+
+        self.other_credentials_button = QAction('Other Credentials',self)
+        self.other_credentials_button.triggered.connect(self.set_credentials)
+        self.filemenu.addAction(self.other_credentials_button)
         self.exit_button = QAction('Exit',self)
         self.exit_button.setShortcut('Ctrl+Q')
         self.exit_button.triggered.connect(self.close)
@@ -168,7 +204,7 @@ class App(QMainWindow):
         self.optionsmenu.addAction(adv_options)
 
         about = QAction('About',self)
-        about.triggered.connect(lambda:QMessageBox.information(self,"About", "Computer Info\nVersion 2.0"))
+        about.triggered.connect(lambda:QMessageBox.information(self,"About", "Computer Info\nVersion 2.1"))
         self.helpmenu.addAction(about)
 
         self.containerWidget = QWidget()
@@ -384,14 +420,14 @@ class App(QMainWindow):
             self.table_tabs.removeTab(5)
             self.table_tabs.removeTab(6)
 
-            self.table1.setRowCount(0)
-            self.shortcuts_table.setRowCount(0)
-            self.scanners_table.setRowCount(0)
-            self.monitors_table.setRowCount(0)
-            self.printers_table.setRowCount(0)
-            self.install_apps_table.setRowCount(0)
-            self.find_apps_table.setRowCount(0)
-            self.find_apps_installs_table.setRowCount(0)
+            self.table1.setRowCount(1)
+            self.shortcuts_table.setRowCount(1)
+            self.scanners_table.setRowCount(1)
+            self.monitors_table.setRowCount(1)
+            self.printers_table.setRowCount(1)
+            self.install_apps_table.setRowCount(1)
+            self.find_apps_table.setRowCount(1)
+            self.find_apps_installs_table.setRowCount(1)
 
             self.table_frame.show()
             self.start_time = time.time()
@@ -900,7 +936,9 @@ class App(QMainWindow):
                         get_printers = get_printers,
                         debug = self.debug,
                         verbose = self.verbose,
-                        profile = True
+                        profile = True,
+                        manual_user = self.custom_user,
+                        manual_pass = self.custom_passwd
                     )
                 )
                 t = WMIThread(target=self.comp_info_objs[-1].get_info,daemon=True)
@@ -1145,6 +1183,7 @@ class App(QMainWindow):
                 debug_print(self.debug,"Unable to get computer info from queue:")
                 debug_print(self.debug,traceback.format_exc())
                 debug_print(self.debug,"++++")
+
                 try:
                     self.workbook.set_working_sheet(self.computers_key)
                     temp_dict = {'status':"Unavailable",'name':item.input_name,'error':item.status}
