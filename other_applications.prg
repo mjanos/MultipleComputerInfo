@@ -53,20 +53,17 @@
   {
     "title":"Chrome",
     "includes":["google","chrome"],
-    "excludes":[],
-    "script_path":"\\\\wpitdrr\\programs\\google\\Google Chrome (web browser)\\chrome_push.vbs"
+    "excludes":[]
   },
   {
     "title":"BedMaster",
     "includes":["bedmaster"],
-    "excludes":[],
-    "script_path":"\\\\wpitdrr\\programs\\bedmaster\\source_install\\bedmaster_install.vbs"
+    "excludes":[]
   },
   {
     "title":"Dell KACE",
     "includes":["dell","kace"],
     "excludes":[],
-    "show version":true,
-    "script_path":"\\\\wpitdrr\\programs\\KACE agent\\kace.vbs"
+    "show version":true
   }
 ]
