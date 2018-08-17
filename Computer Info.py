@@ -3,7 +3,8 @@ import os
 import threading
 import time
 import queue
-from winreg import *
+import ipaddress
+#from winreg import *
 import re
 import traceback
 import ctypes
@@ -11,7 +12,7 @@ from shutil import copyfile
 from collections import OrderedDict
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QAction, QLabel, QFormLayout,QBoxLayout, QVBoxLayout, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QProgressBar, QTabWidget, QFileDialog, QMessageBox, QScrollArea, QStatusBar, QDialog, QTableWidget, QTableWidgetItem, QSplitter, QSizePolicy, QMenu, QCheckBox
 from PyQt5.QtGui import QFont, QBrush, QColor,QCursor
-from PyQt5.QtCore import *
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, pyqtSlot
 from ComputerInfoSharedResources.CIForms import ShortcutCheckboxForm, AuthenticationForm, FileForm, AppsForm
 from ComputerInfoSharedResources.dynamic_forms.forms import DynamicForm
 from ComputerInfoSharedResources.dynamic_forms.models import DynamicModel
@@ -23,25 +24,12 @@ from ComputerInfoSharedResources.CIWMI import ComputerInfo, WMIThread
 from ComputerInfoSharedResources.CICustomWidgets import CustomScrollBox
 import argparse
 from urllib import request
+import logging
+from functools import partial
 
 try:
     from win10toast import ToastNotifier
 except: pass
-
-#global queues
-q = queue.Queue()
-global_icon_path = None
-notification_queue = queue.Queue()
-
-"""
-Functions for printing when the -debug and -verbose flags are active
-"""
-def debug_print(debug,data):
-    if debug:
-        print(data)
-def verbose_print(verbose,data):
-    if verbose:
-        print(data)
 
 def safe_divide(x,y):
     if not x is None and y:
@@ -49,31 +37,27 @@ def safe_divide(x,y):
     else:
         return 0
 
-class GuiThreadClass(QThread):
+class GuiThreadClass(QObject):
 
+    started = pyqtSignal()
     progress_update = pyqtSignal(int,int)
     configure_prog = pyqtSignal(int)
     complete_run = pyqtSignal()
     summary_dict = pyqtSignal(int,dict,dict,dict,dict,list,dict,dict,dict)
 
-    def __init__(self,callback, **kwargs):
+    def __init__(self,callback, *args, **kwargs):
+        self.args = args
         self.kwargs = kwargs
         self.callback = callback
-        QThread.__init__(self)
-        self.kwargs['config_callback'] = self.configure_prog
-        self.kwargs['prog_callback'] = self.progress_update
-        self.kwargs['complete_run'] = self.complete_run
-        self.kwargs['summary_dict'] = self.summary_dict
+        super().__init__()
 
-    def __del__(self):
-        self.wait()
-
+    @pyqtSlot()
     def run(self):
-        self.callback(**self.kwargs)
+        self.callback(*self.args,**self.kwargs)
 
 class App(QMainWindow):
 
-    def __init__(self,parent=None,debug=False,verbose=False,timeout=None,main_wind=None):
+    def __init__(self,parent=None,timeout=None,main_wind=None,logger=None):
         super().__init__()
 
         self.main_wind = main_wind
@@ -83,12 +67,11 @@ class App(QMainWindow):
         #takes json of programs and creates a check list
         self.other_applications = ProgramChoices(["other_applications.prg"],default_folder=os.getenv("APPDATA") + '\\Computer Info',default_filename='other_applications.prg')
 
-        self.full_debug_log = []
+        self.q = queue.Queue()
+        self.logger = logger
         self.running = False
         self.cancel_bool = ThreadSafeBool()
         self.filling_done_bool = ThreadSafeBool()
-        self.debug = debug
-        self.verbose = verbose
         self.timeout = timeout
         self.comp_info_objs = []
         self.comp_obj_complete = {}
@@ -100,112 +83,71 @@ class App(QMainWindow):
         #widgets
         self.innerframe = QTabWidget(parent=self)
 
-        self.create_main_widgets()
-        self.show_edit_options_sidebar()
+        self.createMainWidgets()
+        self.showEditOptionsSidebar()
 
-        debug_print(self.debug,"********Running in Debug Mode********")
+        self.logger.debug("********Running in Debug Mode********")
+        self.t = QThread()
+        self.t.start()
 
-    """
-    Creates window for editing settings.
-    """
-    def show_settings_window(self):
-        top = QDialog(self)
-        top.setWindowTitle("Settings")
-        top.setSizeGripEnabled(True)
-        top_layout = QVBoxLayout()
-        top.setLayout(top_layout)
-
-        settings_form = DynamicForm(top,title="Settings",submit_callback=top.destroy,submit_callback_kwargs={},dynamicmodel=self.settings)
-        top_layout.addWidget(settings_form)
-        top_layout.setAlignment(settings_form,Qt.AlignTop)
-        top.show()
-        top.activateWindow()
-
-    def set_cred_vars(self,user,passwd,top):
-        self.custom_user=user.text()
-        if self.custom_user:
-            self.custom_passwd=passwd.text()
-            self.setWindowTitle("Computer Info (User: python %s)" % self.custom_user)
-        else:
-            self.setWindowTitle("Computer Info")
-        top.close()
-        
-    def set_credentials(self):
-        top = QDialog(self)
-        top.setWindowTitle("Enter Credentials")
-        top.setSizeGripEnabled(True)
-        top_layout = QVBoxLayout()
-        top.setLayout(top_layout)
-        settings_form = QFormLayout()
-        usernamefield=QLineEdit(self.custom_user)
-        passwordfield=QLineEdit(self.custom_passwd)
-        passwordfield.setEchoMode(QLineEdit.Password)
-        submitbtn = QPushButton("Submit")
-        settings_form.addRow("Username",usernamefield)
-        settings_form.addRow("Password",passwordfield)
-        settings_form.addRow(submitbtn)
-        submitbtn.clicked.connect(lambda:self.set_cred_vars(usernamefield,passwordfield,top))
-        
-        top_layout.addLayout(settings_form)
-        top_layout.setAlignment(settings_form, Qt.AlignTop)
-        top.show()
-        top.activateWindow()
-
-    def create_main_widgets(self):
+    def createMainWidgets(self):
         self.setWindowTitle("Computer Info")
-        self.mainmenu = self.menuBar()
-        self.filemenu = self.mainmenu.addMenu('File')
-        self.optionsmenu = self.mainmenu.addMenu('Edit')
-        self.helpmenu = self.mainmenu.addMenu('Help')
+        self.window_menu = self.menuBar()
 
+        self.file_menu = self.window_menu.addMenu('File')
 
-        self.other_credentials_button = QAction('Other Credentials',self)
-        self.other_credentials_button.triggered.connect(self.set_credentials)
-        self.filemenu.addAction(self.other_credentials_button)
-        self.exit_button = QAction('Exit',self)
+        self.other_credentials_button = QAction('Other Credentials', self)
+        self.other_credentials_button.triggered.connect(self.getCredentials)
+        self.file_menu.addAction(self.other_credentials_button)
+        self.exit_button = QAction('Exit', self)
         self.exit_button.setShortcut('Ctrl+Q')
         self.exit_button.triggered.connect(self.close)
-        self.filemenu.addAction(self.exit_button)
+        self.file_menu.addAction(self.exit_button)
 
-        self.push_shortcut_btn = QAction('Push Shortcut',self)
+        self.options_menu = self.window_menu.addMenu('Edit')
+
+        self.push_shortcut_btn = QAction('Push Shortcut', self)
         self.push_shortcut_btn.setCheckable(True)
-        self.push_shortcut_btn.triggered.connect(self.show_edit_options_sidebar)
-        self.optionsmenu.addAction(self.push_shortcut_btn)
+        self.push_shortcut_btn.triggered.connect(self.showEditOptionsSidebar)
+        self.options_menu.addAction(self.push_shortcut_btn)
 
-        self.find_scanners_btn = QAction('Find Scanners',self)
+        self.find_scanners_btn = QAction('Find Scanners', self)
         self.find_scanners_btn.setCheckable(True)
-        self.find_scanners_btn.triggered.connect(self.show_edit_options_sidebar)
-        self.optionsmenu.addAction(self.find_scanners_btn)
+        self.find_scanners_btn.triggered.connect(self.showEditOptionsSidebar)
+        self.options_menu.addAction(self.find_scanners_btn)
 
-        self.find_monitors_btn = QAction('Find Monitors (unreliable)',self)
+        self.find_monitors_btn = QAction('Find Monitors (unreliable)', self)
         self.find_monitors_btn.setCheckable(True)
-        self.find_monitors_btn.triggered.connect(self.show_edit_options_sidebar)
-        self.optionsmenu.addAction(self.find_monitors_btn)
+        self.find_monitors_btn.triggered.connect(self.showEditOptionsSidebar)
+        self.options_menu.addAction(self.find_monitors_btn)
 
-        self.find_printers_btn = QAction("Find Printers",self)
+        self.find_printers_btn = QAction("Find Printers", self)
         self.find_printers_btn.setCheckable(True)
-        self.find_printers_btn.triggered.connect(self.show_edit_options_sidebar)
-        self.optionsmenu.addAction(self.find_printers_btn)
+        self.find_printers_btn.triggered.connect(self.showEditOptionsSidebar)
+        self.options_menu.addAction(self.find_printers_btn)
 
-        self.find_apps_btn = QAction('Find Apps',self)
+        self.find_apps_btn = QAction('Find Apps', self)
         self.find_apps_btn.setCheckable(True)
-        self.find_apps_btn.triggered.connect(self.show_edit_options_sidebar)
-        self.optionsmenu.addAction(self.find_apps_btn)
+        self.find_apps_btn.triggered.connect(self.showEditOptionsSidebar)
+        self.options_menu.addAction(self.find_apps_btn)
 
-        self.install_app_btn = QAction('Install App',self)
+        self.install_app_btn = QAction('Install App', self)
         self.install_app_btn.setCheckable(True)
-        self.install_app_btn.triggered.connect(self.show_edit_options_sidebar)
-        self.optionsmenu.addAction(self.install_app_btn)
+        self.install_app_btn.triggered.connect(self.showEditOptionsSidebar)
+        self.options_menu.addAction(self.install_app_btn)
 
-        self.optionsmenu.addSeparator()
+        self.options_menu.addSeparator()
 
-        adv_options = QAction('Advanced Options',self)
-        adv_options.triggered.connect(self.show_settings_window)
-        self.optionsmenu.addAction(adv_options)
+        adv_options = QAction('Advanced Options', self)
+        adv_options.triggered.connect(self.showSettingsWindow)
+        self.options_menu.addAction(adv_options)
 
-        about = QAction('About',self)
-        about.triggered.connect(lambda:QMessageBox.information(self,"About", "Computer Info\nVersion 2.1"))
-        self.helpmenu.addAction(about)
+        self.help_menu = self.window_menu.addMenu('Help')
+
+        about = QAction('About', self)
+        about.triggered.connect(
+            partial(QMessageBox.information, self, "About", "Computer Info\nVersion 2.1"))
+        self.help_menu.addAction(about)
 
         self.containerWidget = QWidget()
         self.containerlayout = QVBoxLayout()
@@ -215,7 +157,7 @@ class App(QMainWindow):
 
         self.counterbox = QStatusBar()
         self.counterbox.showMessage('- Computers Left')
-        self.counterbox.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed)
+        self.counterbox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.containerlayout.addWidget(self.centralWidget)
         self.containerlayout.addWidget(self.counterbox)
@@ -225,10 +167,11 @@ class App(QMainWindow):
         self.setCentralWidget(self.containerWidget)
 
         self.col_one = QWidget(self)
-        self.col_one.setMinimumSize(400,500)
+        self.col_one.setMinimumSize(400, 500)
         self.col_one_layout = QVBoxLayout()
         self.col_one.setLayout(self.col_one_layout)
-        self.title_label = QLabel("Input a list of computers to get details",self.col_one)
+        self.title_label = QLabel(
+            "Input a list of computers to get details", self.col_one)
         font = QFont()
         font.setPointSize(16)
         self.title_label.setFont(font)
@@ -240,8 +183,8 @@ class App(QMainWindow):
         self.table_frame = QWidget(self.col_one)
         self.table_tabs = QTabWidget(self.table_frame)
         self.table1 = QTableWidget()
-        self.table1.cellDoubleClicked.connect(self.single_comp_app_hook)
-        self.table_tabs.insertTab(0,self.table1,"Computers")
+        self.table1.cellDoubleClicked.connect(self.singleCompAppHook)
+        self.table_tabs.insertTab(0, self.table1, "Computers")
         self.shortcuts_table = QTableWidget()
         self.scanners_table = QTableWidget()
         self.monitors_table = QTableWidget()
@@ -249,8 +192,10 @@ class App(QMainWindow):
         self.install_apps_table = QTableWidget()
         self.find_apps_table = QTableWidget()
         self.find_apps_installs_table = QTableWidget()
-        self.install_apps_table.cellDoubleClicked.connect(self.manual_install_output)
-        self.find_apps_installs_table.cellDoubleClicked.connect(self.checkbox_apps_install_output)
+        self.install_apps_table.cellDoubleClicked.connect(
+            self.manualInstallOutput)
+        self.find_apps_installs_table.cellDoubleClicked.connect(
+            self.checkboxAppsInstallOutput)
 
         self.table1.verticalHeader().setVisible(False)
         self.shortcuts_table.verticalHeader().setVisible(False)
@@ -260,11 +205,11 @@ class App(QMainWindow):
         self.install_apps_table.verticalHeader().setVisible(False)
         self.find_apps_table.verticalHeader().setVisible(False)
         self.find_apps_installs_table.verticalHeader().setVisible(False)
-        self.table_hide_btn = QPushButton("Close Table",self.table_frame)
-        self.table_save_btn = QPushButton("Save Excel",self.table_frame)
+        self.table_hide_btn = QPushButton("Close Table", self.table_frame)
+        self.table_save_btn = QPushButton("Save Excel", self.table_frame)
         self.table_save_btn.setEnabled(False)
-        self.table_hide_btn.clicked.connect(self.restore_input_box)
-        self.table_save_btn.clicked.connect(self.save_excel)
+        self.table_hide_btn.clicked.connect(self.restoreInputBox)
+        self.table_save_btn.clicked.connect(self.saveExcel)
 
         self.table_frame.setLayout(self.table_layout)
         self.table_layout.addWidget(self.table_tabs)
@@ -275,41 +220,44 @@ class App(QMainWindow):
 
         self.table_frame.hide()
 
-        self.run_button = QPushButton('Start',self.col_one)
-        self.run_button.clicked.connect(self.start_scan)
-        self.run_button.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Minimum)
+        self.run_button = QPushButton('Start', self.col_one)
+        self.run_button.clicked.connect(self.startScan)
+        self.run_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-        self.table_unavailable_btn = QCheckBox("Hide 'Unavailable'",self.col_one)
+        self.table_unavailable_btn = QCheckBox(
+            "Hide 'Unavailable'", self.col_one)
         self.table_unavailable_btn.stateChanged.connect(self.setRowsHidden)
-        self.table_unavailable_btn.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.Minimum)
+        self.table_unavailable_btn.setSizePolicy(
+            QSizePolicy.Minimum, QSizePolicy.Minimum)
 
         self.start_layout = QHBoxLayout()
         self.start_layout.addWidget(self.run_button)
         self.start_layout.addWidget(self.table_unavailable_btn)
 
         self.running_frame = QWidget()
-        self.running_frame.setContentsMargins(0,0,0,0)
+        self.running_frame.setContentsMargins(0, 0, 0, 0)
         self.running_frame_layout = QHBoxLayout()
         self.running_frame.setLayout(self.running_frame_layout)
         self.prog = QProgressBar()
         self.prog.setAlignment(Qt.AlignCenter)
-        self.cancelbtn = QPushButton("Cancel",self.running_frame)
+        self.cancelbtn = QPushButton("Cancel", self.running_frame)
         self.cancelbtn.setEnabled(False)
-        self.cancelbtn.clicked.connect(self.cancel_btn_action)
+        self.cancelbtn.clicked.connect(self.cancelBtnAction)
         self.running_frame_layout.addWidget(self.prog)
         self.running_frame_layout.addWidget(self.cancelbtn)
 
         self.col_one_layout.addWidget(self.title_label)
         self.col_one_layout.addWidget(self.inbox)
         self.col_one_layout.addLayout(self.start_layout)
-        # self.col_one_layout.addWidget(self.table_unavailable_btn)
         self.col_one_layout.addWidget(self.running_frame)
         self.title_label.setAlignment(Qt.AlignCenter)
 
         self.split = QHBoxLayout()
         self.split.addWidget(self.col_one)
         self.split.addWidget(self.innerframe)
-        self.innerframe.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.Expanding)
+        self.innerframe.setSizePolicy(
+            QSizePolicy.Minimum, QSizePolicy.Expanding)
         self.innermainlayout.addLayout(self.split)
 
         self.push_shortcut_tab = QWidget()
@@ -323,7 +271,7 @@ class App(QMainWindow):
         self.find_apps_tab_layout = QVBoxLayout()
         self.find_apps_tab_layout.setAlignment(Qt.AlignTop)
         self.find_apps_tab.setLayout(self.find_apps_tab_layout)
-        self.innerframe.insertTab(2,self.find_apps_tab,"Find Apps")
+        self.innerframe.insertTab(2, self.find_apps_tab, "Find Apps")
         self.innerframe.removeTab(2)
 
         self.install_app_tab = QWidget()
@@ -331,80 +279,126 @@ class App(QMainWindow):
         self.install_app_tab_layout.setAlignment(Qt.AlignTop)
         self.install_app_tab.setLayout(self.install_app_tab_layout)
 
-        self.check_form = ShortcutCheckboxForm(self.push_shortcut_tab,title="Choose where to place Shortcuts")
+        self.check_form = ShortcutCheckboxForm(
+            self.push_shortcut_tab, title="Choose where to place Shortcuts")
         self.push_shortcut_tab_layout.addWidget(self.check_form)
 
-        self.shortcut_file_form = FileForm(extensionsallowed="Shortcut Files (*.url;*.lnk;*.exe;*.rdp)", title="Choose Shortcut File")
+        self.shortcut_file_form = FileForm(
+            extensionsallowed="Shortcut Files (*.url;*.lnk;*.exe;*.rdp)", title="Choose Shortcut File")
         self.push_shortcut_tab_layout.addWidget(self.shortcut_file_form)
 
         self.apps_form = AppsForm(programs_obj=self.other_applications)
-        #self.find_apps_tab_layout.addWidget(self.apps_form)
         self.find_apps_tab.setWidget(self.apps_form)
 
-        self.app_file_form = FileForm(extensionsallowed="VBScript, Powershell Script, Python Script (*.vbs *.ps1 *.py)",title="Choose Script File")
+        self.app_file_form = FileForm(
+            extensionsallowed="VBScript, Powershell Script, Python Script (*.vbs *.ps1 *.py)", title="Choose Script File")
         self.install_app_tab_layout.addWidget(self.app_file_form)
-
-        #self.resize(self.width(),self.height()+200)
 
         self.show()
         self.innerframe.show()
-        self.full_table = None
 
-    """
-    Hooks into companion program passing along computer name.
-    Requires registry entry that associates 'singlecomputerinfo' URI with Single Computer Info
-    """
-    def single_comp_app_hook(self,row,col):
-        if col == 1 or col == 2:
-            os.startfile("singlecomputerinfo:%s" % self.table1.item(row,col).text())
-
-    """
-    Displays tabs based off of edit menu checkboxes
-    """
-    def show_edit_options_sidebar(self):
-        self.innerframe.clear()
-        if self.push_shortcut_btn.isChecked() or self.find_apps_btn.isChecked() or self.install_app_btn.isChecked():
-            self.innerframe.show()
-        else:
-            self.innerframe.hide()
-
-        if self.push_shortcut_btn.isChecked():
-            self.innerframe.addTab(self.push_shortcut_tab,"Shortcuts")
-
-        if self.find_apps_btn.isChecked():
-            self.innerframe.addTab(self.find_apps_tab,"Find Apps")
-
-        if self.install_app_btn.isChecked():
-            self.innerframe.addTab(self.install_app_tab,"Install Apps")
-
-    """
-    Sets cancel_bool to safely end work
-    """
-    def cancel_btn_action(self):
+    def cancelBtnAction(self):
+        """
+        Sets cancel_bool to safely end work
+        """
         self.cancel_bool.setTrue()
         self.cancelbtn.setText("Cancelling...")
         self.cancelbtn.setEnabled(False)
 
-    """
-    Close Table and replace with input box
-    """
-    def restore_input_box(self):
-        self.col_one_layout.replaceWidget(self.table_frame,self.inbox)
+    def restoreInputBox(self):
+        """
+        Close Table and replace with input box
+        """
+        self.col_one_layout.replaceWidget(self.table_frame, self.inbox)
         self.table_frame.hide()
         self.inbox.show()
         self.table_save_btn.setEnabled(False)
 
-    """
-    Enables and disables buttons while running or stopped and resets variables for new run
-    """
-    def toggle_running_state(self):
+    def showEditOptionsSidebar(self):
+        """
+        Displays tabs based off of edit menu checkboxes
+        """
+        self.innerframe.clear()
+        if self.push_shortcut_btn.isChecked() or self.find_apps_btn.isChecked() or self.install_app_btn.isChecked():
+            self.innerframe.show()
+
+            if self.push_shortcut_btn.isChecked():
+                self.innerframe.addTab(self.push_shortcut_tab, "Shortcuts")
+
+            if self.find_apps_btn.isChecked():
+                self.innerframe.addTab(self.find_apps_tab, "Find Apps")
+
+            if self.install_app_btn.isChecked():
+                self.innerframe.addTab(self.install_app_tab, "Install Apps")
+        else:
+            self.innerframe.hide()
+
+    def showSettingsWindow(self):
+        """
+        Creates window for editing settings.
+        """
+        top = QDialog(self)
+        top.setWindowTitle("Settings")
+        top.setSizeGripEnabled(True)
+        top_layout = QVBoxLayout()
+        top.setLayout(top_layout)
+
+        settings_form = DynamicForm(top,title="Settings",submit_callback=top.destroy,submit_callback_kwargs={},dynamicmodel=self.settings)
+        top_layout.addWidget(settings_form)
+        top_layout.setAlignment(settings_form,Qt.AlignTop)
+        top.show()
+        top.activateWindow()
+
+    def setCredentials(self,user,passwd,top):
+        self.custom_user=user.text()
+        if self.custom_user:
+            self.custom_passwd=passwd.text()
+            self.setWindowTitle("Computer Info (User: %s)" % self.custom_user)
+        else:
+            self.setWindowTitle("Computer Info")
+        top.close()
+        
+    def getCredentials(self):
+        top = QDialog(self)
+        top.setWindowTitle("Enter Credentials")
+        top.setSizeGripEnabled(True)
+        top_layout = QVBoxLayout()
+        top.setLayout(top_layout)
+        settings_form = QFormLayout()
+        usernamefield=QLineEdit(self.custom_user)
+        passwordfield=QLineEdit(self.custom_passwd)
+        passwordfield.setEchoMode(QLineEdit.Password)
+        submitbtn = QPushButton("Submit")
+        settings_form.addRow("Username",usernamefield)
+        settings_form.addRow("Password",passwordfield)
+        settings_form.addRow(submitbtn)
+        submitbtn.clicked.connect(partial(self.setCredentials,usernamefield,passwordfield,top))
+        
+        top_layout.addLayout(settings_form)
+        top_layout.setAlignment(settings_form, Qt.AlignTop)
+        top.show()
+        top.activateWindow()
+
+    def singleCompAppHook(self,row,col):
+        """
+        Hooks into companion program passing along computer name.
+        Requires registry entry that associates 'singlecomputerinfo' URI with Single Computer Info
+        """
+        if col == 1 or col == 2:
+            os.startfile("singlecomputerinfo:%s" % self.table1.item(row,col).text())
+
+    def toggleRunningState(self):
+        """
+        Enables and disables buttons while running or stopped and resets variables for new run
+        """
         if not self.running:
             self.comp_obj_complete = {}
             self.table_hide_btn.setEnabled(False)
+            self.table_save_btn.setEnabled(False)
             self.cancelbtn.setEnabled(True)
             self.run_button.setEnabled(False)
             self.inbox.setEnabled(False)
-            self.optionsmenu.setEnabled(False)
+            self.options_menu.setEnabled(False)
             self.table_unavailable_btn.setEnabled(False)
             self.check_form.form_disable()
             self.shortcut_file_form.form_disable()
@@ -438,16 +432,17 @@ class App(QMainWindow):
             except:
                 self.install_script_name = "Manual Install"
 
-            if type(self.install_script_name) is str:
+            if isinstance(self.install_script_name, str):
                 self.install_script_name = self.install_script_name.replace("_"," ")
 
         else:
             self.table_hide_btn.setEnabled(True)
+            
             self.end_time = time.time()
             self.cancelbtn.setEnabled(False)
             self.run_button.setEnabled(True)
             self.inbox.setEnabled(True)
-            self.optionsmenu.setEnabled(True)
+            self.options_menu.setEnabled(True)
             self.table_unavailable_btn.setEnabled(True)
             self.check_form.form_enable()
             self.shortcut_file_form.form_enable()
@@ -455,10 +450,10 @@ class App(QMainWindow):
             self.app_file_form.form_enable()
             self.running = False
 
-    """
-    Retrieve checkbox values for apps
-    """
-    def get_checkbox_apps(self):
+    def getCheckboxApps(self):
+        """
+        Retrieve checkbox values for apps
+        """
         self.chosen_executes = []
         self.chosen_apps = []
         exe_widget_list = []
@@ -475,10 +470,10 @@ class App(QMainWindow):
                 self.chosen_executes.append(val)
         return (self.chosen_apps,self.chosen_executes)
 
-    """
-    Sets columns and sheets for excel output
-    """
-    def set_table_columns(self):
+    def setTableColumns(self):
+        """
+        Sets columns and sheets for excel output
+        """
         self.table_tabs.clear()
         self.table_tabs.addTab(self.table1,"Computers")
         self.main_columns = ["Status","Name","IP Address","Serial","Model","Username","OS","Resolution","Monitors","CPU","Memory","Error","Profile Time"]
@@ -528,7 +523,7 @@ class App(QMainWindow):
         self.chosen_executes = None
         if self.find_apps_btn.isChecked():
 
-            self.chosen_apps, self.chosen_executes = self.get_checkbox_apps()
+            self.chosen_apps, self.chosen_executes = self.getCheckboxApps()
 
             self.table_tabs.addTab(self.find_apps_table,"Find Apps")
             if self.chosen_executes:
@@ -545,10 +540,10 @@ class App(QMainWindow):
             self.find_apps_installs_table.setColumnCount(len(self.exes_columns))
             self.find_apps_installs_table.setHorizontalHeaderLabels(self.exes_columns)
 
-    """
-    Starts new threads for each computer up to the 'thread clusters' number specified in the settings.
-    """
-    def queue_threads(self):
+    def queueThreads(self):
+        """
+        Starts new threads for each computer up to the 'thread clusters' number specified in the settings.
+        """
         self.started_threads = []
         while not self.threads.empty():
             if self.running_threads.get() < int(self.settings.settings_dict.get('thread clusters',15)):
@@ -561,10 +556,11 @@ class App(QMainWindow):
         self.filling_done_bool.setTrue()
         self.started_threads = []
 
-    """
-    Updates progress bar and remaining computer count
-    """
-    def update_progress_bar(self,val,max_val):
+    @pyqtSlot(int,int)
+    def updateProgressBar(self,val,max_val):
+        """
+        Updates progress bar and remaining computer count
+        """
         self.prog.setValue(max_val-val)
         percent = self.prog.value()
         avg_time = safe_divide((time.time() - self.start_time),int(percent))
@@ -578,10 +574,11 @@ class App(QMainWindow):
         else:
             self.counterbox.showMessage("Done.")
 
-    """
-    Shows relevant tables and initializes percentage and counter
-    """
-    def initialize_progress_UI(self,val):
+    @pyqtSlot(int)
+    def initializeProgressUI(self,val):
+        """
+        Shows relevant tables and initializes percentage and counter
+        """
         self.prog.setMaximum(self.count.get())
 
         self.table1.setRowCount(0)
@@ -641,25 +638,27 @@ class App(QMainWindow):
                 self.find_apps_installs_table.setItem(c['count'],next((i for i,x in enumerate(self.exes_columns) if x.lower().strip() == "name"),None),find_apps_install_table_temp_item)
         self.counterbox.showMessage("%s Computers Left (- remaining)" % (str(val)))
 
-    """
-    Toggles running state and fixes any PCs that may have been skipped over due to error.
-    Then posts a toast notification that the application has completed on all hosts.
-    """
-    def finalize_progress(self):
-        self.toggle_running_state()
-        self.fix_blanks()
-        temp_t = threading.Thread(target=self.post_toast,daemon=True)
+    @pyqtSlot()
+    def finalizeProgress(self):
+        """
+        Toggles running state and fixes any PCs that may have been skipped over due to error.
+        Then posts a toast notification that the application has completed on all hosts.
+        """
+        self.toggleRunningState()
+        self.fixBlanks()
+        temp_t = threading.Thread(target=self.postToast,daemon=True)
         temp_t.start()
         self.table_save_btn.setEnabled(True)
-        self.set_summary()
+        self.setSummary()
         if self.cancel_bool.get():
             self.cancel_bool.setFalse()
             self.cancelbtn.setText("Cancel")
 
-    """
-    Adds items to tables and formats them appropriately
-    """
-    def update_counts(self,row,temp_dict,temp_icon_dict,temp_scanner_dict,temp_monitor_dict,temp_printer_dict_list,temp_manual_app_dict,temp_checkbox_apps_dict,temp_checkbox_exes_dict):
+    @pyqtSlot(int, dict, dict, dict, dict, list, dict, dict, dict)
+    def updateCounts(self,row,temp_dict,temp_icon_dict,temp_scanner_dict,temp_monitor_dict,temp_printer_dict_list,temp_manual_app_dict,temp_checkbox_apps_dict,temp_checkbox_exes_dict):
+        """
+        Adds items to tables and formats them appropriately
+        """
         def add_items(table,columns,input_dict,color_scheme=[]):
             temp_list = [t.lower() for t in columns]
             for k,v in input_dict.items():
@@ -697,31 +696,32 @@ class App(QMainWindow):
         try:
             add_items(self.shortcuts_table,self.icon_columns,temp_icon_dict,color_scheme=[('Done',"#98FB98")])
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception: self.logger.debug("Failed adding item to table", exc_info=True)
         try:
             add_items(self.scanners_table,self.scanner_columns,temp_scanner_dict)
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception: self.logger.debug("Failed adding item to table", exc_info=True)
         try:
             add_items(self.monitors_table,self.monitor_columns,temp_monitor_dict)
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception: self.logger.debug("Failed adding item to table", exc_info=True)
         try:
             add_multiple_items(self.printers_table,self.printer_columns,temp_printer_dict_list)
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception: self.logger.debug("Failed adding item to table", exc_info=True)
         try:
             add_items(self.install_apps_table,self.install_columns,temp_manual_app_dict,color_scheme=[('Success',"#98FB98"),('Already Installed',"#F0F8FF")])
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception: self.logger.debug("Failed adding item to table", exc_info=True)
         try:
             add_items(self.find_apps_table,self.apps_columns,temp_checkbox_apps_dict,color_scheme=[('Success',"#98FB98"),('Already Installed',"#F0F8FF")])
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception: self.logger.debug("Failed adding item to table", exc_info=True)
         try:
             add_items(self.find_apps_installs_table,self.exes_columns,temp_checkbox_exes_dict,color_scheme=[('Success',"#98FB98"),('Already Installed',"#F0F8FF")])
         except AttributeError:pass
-        except Exception as e: debug_print(self.debug,e)
+        except Exception:
+            self.logger.debug("Failed adding item to table")
 
         if self.table_unavailable_btn.isChecked() and self.table1.item(row,0).text().lower().strip() == "unavailable":
             self.table1.setRowHidden(row,True)
@@ -744,92 +744,11 @@ class App(QMainWindow):
             if self.find_apps_installs_table.rowCount():
                 self.find_apps_installs_table.setRowHidden(row,True)
 
-    """
-    Generates a window with the output of a vbs installer.
-    VBS installers are vbs files that attempt to run commands on remote machines.
-    The VBscript will run for each host specified and will send a parameter to the VBS with the given hostname.
-    """
-    def manual_install_output(self,row,col):
-        try:
-            top = QDialog(self)
-            top.setWindowTitle("Install Output")
-            top.setSizeGripEnabled(True)
-            #top.setWindowModality(Qt.ApplicationModal)
-            top_layout = QVBoxLayout()
-            top.setLayout(top_layout)
-            titlelabel = QLabel(self.comp_obj_complete[row].input_name.upper())
-            font = QFont()
-            font.setPointSize(16)
-            titlelabel.setFont(font)
-            top_layout.addWidget(titlelabel)
-            top_layout.setAlignment(titlelabel,Qt.AlignCenter)
-
-            installout = QLabel()
-            installout.setStyleSheet("background-color:black;color:white")
-            installout.setContentsMargins(10,10,10,10)
-            top_layout.addWidget(installout)
-            top_layout.setAlignment(installout,Qt.AlignTop)
-            try: installout.setText(self.comp_obj_complete[row].out1.decode('utf-8'))
-            except:installout.setText("                    ")
-
-            try:
-                if self.comp_obj_complete[row].out1_err.decode('utf-8'):
-                    errout = QLabel(self.comp_obj_complete[row].out1_err.decode('utf-8'))
-                    errout.setStyleSheet("background-color:#8B0000;color:white")
-                    errout.setContentsMargins(10,10,10,10)
-                    top_layout.addWidget(errout)
-                    top_layout.setAlignment(errout,Qt.AlignTop)
-            except:installout.setText("                    ")
-
-
-            top.show()
-            top.activateWindow()
-        except:pass
-
-    """
-    Similar to manual_install_output except shows output of installers for apps chosen from the "Find Apps" list.
-    """
-    def checkbox_apps_install_output(self,row,col):
-        try:
-            top = QDialog(self)
-            top.setWindowTitle("Install Output")
-            top.setSizeGripEnabled(True)
-            #top.setWindowModality(Qt.ApplicationModal)
-            top_layout = QVBoxLayout()
-            top.setLayout(top_layout)
-            titlelabel = QLabel(self.comp_obj_complete[row].input_name.upper())
-            font = QFont()
-            font.setPointSize(16)
-            titlelabel.setFont(font)
-            top_layout.addWidget(titlelabel)
-            top_layout.setAlignment(titlelabel,Qt.AlignCenter)
-
-            try:
-                installout = QLabel(self.comp_obj_complete[row].out2.decode('utf-8'))
-                installout.setStyleSheet("background-color:black;color:white")
-                installout.setContentsMargins(10,10,10,10)
-                top_layout.addWidget(installout)
-                top_layout.setAlignment(installout,Qt.AlignTop)
-            except:pass
-
-            try:
-                if self.comp_obj_complete[row].out2_err.decode('utf-8'):
-                    errout = QLabel(self.comp_obj_complete[row].out2_err.decode('utf-8'))
-                    errout.setStyleSheet("background-color:#8B0000;color:white")
-                    errout.setContentsMargins(10,10,10,10)
-                    top_layout.addWidget(errout)
-                    top_layout.setAlignment(errout,Qt.AlignTop)
-            except:pass
-
-            top.show()
-            top.activateWindow()
-        except:pass
-
-    """
-    Activated by pressing start button. Creates a GUIThreadClass Object with all necessary options.
-    Connects thread to signals to change UI after each PC completes.
-    """
-    def start_scan(self):
+    def startScan(self):
+        """
+        Activated by pressing start button. Creates a GUIThreadClass Object with all necessary options.
+        Connects thread to signals to change UI after each PC completes.
+        """
         if self.push_shortcut_btn.isChecked() and not self.shortcut_file_form.filename:
             QMessageBox.critical(self,"Icon File Missing","Please choose an icon file to push")
             return
@@ -844,10 +763,10 @@ class App(QMainWindow):
 
         self.master_pc_list = []
 
-        self.toggle_running_state()
-        self.set_table_columns()
+        self.toggleRunningState()
+        self.setTableColumns()
 
-        self.t = GuiThreadClass(self.get_computer_names,
+        self.wt = GuiThreadClass(self.getComputerNames,
                 fullbox = self.inbox.toPlainText().splitlines(),
                 icon = self.push_shortcut_btn.isChecked(),
                 get_devices = self.find_scanners_btn.isChecked(),
@@ -859,21 +778,21 @@ class App(QMainWindow):
                 get_apps = self.find_apps_btn.isChecked(),
                 install_app = self.install_app_btn.isChecked(),
         )
-        self.t.start()
-        self.t.progress_update.connect(self.update_progress_bar)
-        self.t.configure_prog.connect(self.initialize_progress_UI)
-        self.t.complete_run.connect(self.finalize_progress)
-        self.t.summary_dict.connect(self.update_counts)
+        self.wt.moveToThread(self.t)
+        self.wt.started.connect(self.wt.run)
+        self.wt.progress_update.connect(self.updateProgressBar)
+        self.wt.configure_prog.connect(self.initializeProgressUI)
+        self.wt.complete_run.connect(self.finalizeProgress)
+        self.wt.summary_dict.connect(self.updateCounts)
+        self.wt.started.emit()
 
         self.counterbox.showMessage('Queuing Threads (May take some time with many PCs)')
 
-    """
-    Main method for handling objects and starting each query. It then updates the spreadsheet.
-    """
-    def get_computer_names(self,**kwargs):
+    def getComputerNames(self,**kwargs):
+        """
+        Main method for handling objects and starting each query. It then updates the spreadsheet.
+        """
         #toggle running state then check if folders
-        autoretry = kwargs.pop('autoretry',False)
-        multirun= kwargs.pop('multirun',False)
         fullbox = kwargs.pop('fullbox',None)
         icon = kwargs.pop('icon',None)
         get_devices = kwargs.pop('get_devices',None)
@@ -884,10 +803,6 @@ class App(QMainWindow):
         startup_check = kwargs.pop('startup_check',None)
         get_apps = kwargs.pop('get_apps',None)
         install_app = kwargs.pop('install_app',None)
-        prog_callback = kwargs.pop('prog_callback',None)
-        config_callback = kwargs.pop('config_callback',None)
-        complete_run = kwargs.pop('complete_run',None)
-        summary_dict = kwargs.pop('summary_dict',None)
 
         self.summary = OrderedDict()
         self.summary['totals'] = {'success':0,'total computers':0}
@@ -910,13 +825,21 @@ class App(QMainWindow):
         else:
             single_app_install = None
 
+        #expand fullbox with subnets here
+        for i,l in enumerate(fullbox):
+            pattern = re.compile(r'^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$')
+            pmatch = pattern.match(l.strip())
+            if pmatch:
+                self.logger.debug("Found match for %s" % l.strip())
+                fullbox = fullbox[:i] + [str(t) for t in ipaddress.IPv4Network(l.strip()).hosts()] + fullbox[i+1:]
+
         for line in fullbox:
             if line.strip() != "":
                 self.master_pc_list.append({'name':line.strip(),'count':self.threads.qsize()})
                 self.summary['totals']['total computers'] += 1
                 self.comp_info_objs.append(
                     ComputerInfo(
-                        q=q,
+                        q=self.q,
                         input_name=line.strip(),
                         count=self.threads.qsize(),
                         icon=icon,
@@ -934,8 +857,7 @@ class App(QMainWindow):
                         install_applications = self.chosen_executes,
                         single_app_install = single_app_install,
                         get_printers = get_printers,
-                        debug = self.debug,
-                        verbose = self.verbose,
+                        logger = self.logger,
                         profile = True,
                         manual_user = self.custom_user,
                         manual_pass = self.custom_passwd
@@ -947,8 +869,8 @@ class App(QMainWindow):
         self.countdown.set(self.threads.qsize())
         self.count.set(self.threads.qsize())
 
-        config_callback.emit(self.countdown.get())
-        queue_filler = threading.Thread(target=self.queue_threads,daemon=True)
+        self.wt.configure_prog.emit(self.countdown.get())
+        queue_filler = threading.Thread(target=self.queueThreads,daemon=True)
         queue_filler.start()
 
         #Set queue timeout for computers that hang WMI
@@ -984,7 +906,7 @@ class App(QMainWindow):
                 if self.cancel_bool.get():
                     timeout = 0
 
-                item = q.get(timeout=timeout)
+                item = self.q.get(timeout=timeout)
                 self.comp_obj_complete[item.count] = item
 
                 if item:
@@ -1020,7 +942,7 @@ class App(QMainWindow):
                         self.workbook.set_or_create_worksheet("Scanners",columns=self.scanner_columns)
                         scanner_text = ""
                         for s in list(set(item.devices)):
-                            if "fi-" in s:
+                            if s and "fi-" in s:
                                 scanner_text += s + "\n"
                         temp_scanner_dict = {'status':temp_dict.get('status',"Unknown"),'name':item.name,'ip address':temp_dict['ip address'],"scanners":scanner_text}
                         if not item.ip_addresses:
@@ -1091,7 +1013,6 @@ class App(QMainWindow):
                                     temp_checkbox_apps_dict[k.lower()] = v
 
                         self.workbook.working_sheet.add_row(temp_checkbox_apps_dict,row=item.count+2)
-                        #workbook
 
                         temp_checkbox_exes_dict = {'status':temp_dict.get('status',"Unknown"),'name':item.name,'ip address':temp_dict['ip address']}
                         if item.ip_addresses:
@@ -1115,7 +1036,7 @@ class App(QMainWindow):
                                     self.summary['apps installed'][k.lower()] += 1
                                 else:
                                     self.summary['apps installed'][k.lower()] = 1
-                            debug_print(self.debug,"installer: %s" % k)
+                            self.logger.debug("installer: %s" % k)
                         if self.chosen_executes:
                             self.workbook.set_or_create_worksheet("Installs",columns=self.exes_columns,wrap=True)
                             self.workbook.working_sheet.add_row(temp_checkbox_exes_dict,row=item.count+2)
@@ -1146,8 +1067,7 @@ class App(QMainWindow):
                                     self.workbook.set_or_create_worksheet("Installs",columns=self.exes_columns)
                                     self.workbook.working_sheet.add_row({'status':"Cancelled",'name':item.input_name},row=item.count+2)
                         except Exception as e:
-                            debug_print(self.debug,"Error writing unavailable pc to sheet:")
-                            debug_print(self.debug,traceback.format_exc())
+                            self.logger.debug("Error writing unavailable pc to sheet:", exc_info=True)
                     else:
                         temp_dict = {'status':"Unavailable",'name':item.input_name,'error':item.status}
                         try:
@@ -1172,17 +1092,13 @@ class App(QMainWindow):
                                 if self.chosen_executes:
                                     self.workbook.set_or_create_worksheet("Installs",columns=self.exes_columns)
                                     self.workbook.working_sheet.add_row({'status':"Unavailable",'name':item.input_name},row=item.count+2)
-                        except Exception as e:
-                            debug_print(self.debug,"Error writing unavailable pc to sheet:")
-                            debug_print(self.debug,traceback.format_exc())
+                        except Exception:
+                            self.logger.debug("Error writing unavailable pc to sheet:", exc_info=True)
 
-            except queue.Empty as e:
-                debug_print(self.debug,"Queue Timeout")
-            except Exception as e:
-                debug_print(self.debug,"++++")
-                debug_print(self.debug,"Unable to get computer info from queue:")
-                debug_print(self.debug,traceback.format_exc())
-                debug_print(self.debug,"++++")
+            except queue.Empty:
+                self.logger.debug("Queue Timeout")
+            except Exception:
+                self.logger.debug("Unable to get computer info from queue:", exc_info=True)
 
                 try:
                     self.workbook.set_working_sheet(self.computers_key)
@@ -1191,13 +1107,15 @@ class App(QMainWindow):
                     if icon:
                         self.workbook.set_or_create_worksheet("Icon Push",columns=self.icon_columns)
                         self.workbook.working_sheet.add_row({'name':item.input_name,'error':e},row=item.count+2)
-                except Exception as e: debug_print(self.debug,e)
+                except Exception:
+                    self.logger.debug(
+                        "Failed setting PC unavailable in worksheet", exc_info=True)
             finally:
                 self.countdown.decrement()
-                prog_callback.emit(self.countdown.get(),self.count.get())
+                self.wt.progress_update.emit(self.countdown.get(),self.count.get())
                 if item:
 
-                    summary_dict.emit(
+                    self.wt.summary_dict.emit(
                                     item.count,
                                     temp_dict,
                                     temp_icon_dict,
@@ -1208,14 +1126,13 @@ class App(QMainWindow):
                                     temp_checkbox_apps_dict,
                                     temp_checkbox_exes_dict,
                                     )
-                    self.full_debug_log.append({'name':item.input_name,'serial':item.serial,'debug':item.debug_log})
 
-        complete_run.emit()
+        self.wt.complete_run.emit()
 
-    """
-    Creates a toast notification to let the user know the scan has completed
-    """
-    def post_toast(self):
+    def postToast(self):
+        """
+        Creates a toast notification to let the user know the scan has completed
+        """
         if self.lock_toast.acquire(timeout=15):
             try:
                 toaster = ToastNotifier()
@@ -1223,15 +1140,15 @@ class App(QMainWindow):
                     toaster.show_toast("Complete!","Scan/Install is complete.\n%s out of %s computers online" % (self.summary['totals']['success'],self.summary['totals']['total computers']),icon_path=global_icon_path,duration=10)
                 else:
                     toaster.show_toast("Complete!","Scan/Install is complete.",duration=10)
-            except Exception as e: debug_print(self.debug,e)
+            except Exception: self.logger.debug("Failed showing notification", exc_info=True)
             finally: self.lock_toast.release()
         else:
-            debug_print(self.debug,"Unable to get lock on toast. Giving up.")
+            self.logger.debug("Unable to get lock on toast. Giving up.")
 
-    """
-    Fixes cases where queue timesout and no information returns. Ensures that the name fields are filled
-    """
-    def fix_blanks(self):
+    def fixBlanks(self):
+        """
+        Fixes cases where queue timesout and no information returns. Ensures that the name fields are filled
+        """
         self.workbook.set_working_sheet(self.computers_key)
         for pc in self.master_pc_list:
             if not self.workbook.working_sheet.sheet.cell(row=pc['count']+2,column=1).value:
@@ -1259,9 +1176,8 @@ class App(QMainWindow):
                         if self.chosen_executes:
                             self.workbook.set_or_create_worksheet("Installs",columns=self.exes_columns)
                             self.workbook.working_sheet.sheet.cell(row=pc['count']+2,column=2,value=pc['name'])
-                except Exception as e:
-                    debug_print(self.debug,"Error fixing timed out computer names:")
-                    debug_print(self.debug,traceback.format_exc())
+                except Exception:
+                    self.logger.debug("Error fixing timed out computer names:", exc_info=True)
 
         for r in range(1,self.table1.rowCount()+1):
             if self.table1.item(r,0) and self.table1.item(r,0).text() == "Queued":
@@ -1271,10 +1187,10 @@ class App(QMainWindow):
                     self.table1.item(r,0).setText("Queue Timeout")
         self.table1.resizeColumnsToContents()
 
-    """
-    Used to hide rows where the computer was "Unavailable"
-    """
     def setRowsHidden(self,stateval):
+        """
+        Used to hide rows where the computer was "Unavailable"
+        """
         if stateval:
             hide_row = True
         else:
@@ -1313,10 +1229,103 @@ class App(QMainWindow):
                 if not self.find_apps_installs_table.item(r,0) or self.find_apps_installs_table.item(r,0) and self.find_apps_installs_table.item(r,0).text() != "Online":
                     self.find_apps_installs_table.setRowHidden(r,hide_row)
 
-    """
-    Saves spreadsheet to file with dialog
-    """
-    def set_summary(self):
+    def manualInstallOutput(self, row, col):
+        """
+        Generates a window with the output of a vbs installer.
+        VBS installers are vbs files that attempt to run commands on remote machines.
+        The VBscript will run for each host specified and will send a parameter to the VBS with the given hostname.
+        """
+        try:
+            top = QDialog(self)
+            top.setWindowTitle("Install Output")
+            top.setSizeGripEnabled(True)
+            #top.setWindowModality(Qt.ApplicationModal)
+            top_layout = QVBoxLayout()
+            top.setLayout(top_layout)
+            titlelabel = QLabel(self.comp_obj_complete[row].input_name.upper())
+            font = QFont()
+            font.setPointSize(16)
+            titlelabel.setFont(font)
+            top_layout.addWidget(titlelabel)
+            top_layout.setAlignment(titlelabel, Qt.AlignCenter)
+
+            installout = QLabel()
+            installout.setStyleSheet("background-color:black;color:white")
+            installout.setContentsMargins(10, 10, 10, 10)
+            top_layout.addWidget(installout)
+            top_layout.setAlignment(installout, Qt.AlignTop)
+            try:
+                installout.setText(
+                    self.comp_obj_complete[row].out1.decode('utf-8'))
+            except:
+                installout.setText("                    ")
+
+            try:
+                if self.comp_obj_complete[row].out1_err.decode('utf-8'):
+                    errout = QLabel(
+                        self.comp_obj_complete[row].out1_err.decode('utf-8'))
+                    errout.setStyleSheet(
+                        "background-color:#8B0000;color:white")
+                    errout.setContentsMargins(10, 10, 10, 10)
+                    top_layout.addWidget(errout)
+                    top_layout.setAlignment(errout, Qt.AlignTop)
+            except:
+                installout.setText("                    ")
+
+            top.show()
+            top.activateWindow()
+        except:
+            pass
+
+    def checkboxAppsInstallOutput(self, row, col):
+        """
+        Similar to manualInstallOutput except shows output of installers for apps chosen from the "Find Apps" list.
+        """
+        try:
+            top = QDialog(self)
+            top.setWindowTitle("Install Output")
+            top.setSizeGripEnabled(True)
+            #top.setWindowModality(Qt.ApplicationModal)
+            top_layout = QVBoxLayout()
+            top.setLayout(top_layout)
+            titlelabel = QLabel(self.comp_obj_complete[row].input_name.upper())
+            font = QFont()
+            font.setPointSize(16)
+            titlelabel.setFont(font)
+            top_layout.addWidget(titlelabel)
+            top_layout.setAlignment(titlelabel, Qt.AlignCenter)
+
+            try:
+                installout = QLabel(
+                    self.comp_obj_complete[row].out2.decode('utf-8'))
+                installout.setStyleSheet("background-color:black;color:white")
+                installout.setContentsMargins(10, 10, 10, 10)
+                top_layout.addWidget(installout)
+                top_layout.setAlignment(installout, Qt.AlignTop)
+            except:
+                pass
+
+            try:
+                if self.comp_obj_complete[row].out2_err.decode('utf-8'):
+                    errout = QLabel(
+                        self.comp_obj_complete[row].out2_err.decode('utf-8'))
+                    errout.setStyleSheet(
+                        "background-color:#8B0000;color:white")
+                    errout.setContentsMargins(10, 10, 10, 10)
+                    top_layout.addWidget(errout)
+                    top_layout.setAlignment(errout, Qt.AlignTop)
+            except:
+                pass
+
+            top.show()
+            top.activateWindow()
+        except:
+            pass
+
+    def setSummary(self):
+        """
+        Saves spreadsheet to file with dialog
+        """
         self.workbook.set_working_sheet(self.summary_key)
 
         success_percent = safe_divide(self.summary['totals']['success'],self.summary['totals']['total computers'])
@@ -1344,10 +1353,10 @@ class App(QMainWindow):
         if self.install_app_btn.isChecked():
             self.workbook.working_sheet.add_grouping("Installs",*install_status_args)
 
-    """
-    Creates and saves data to an Excel spreadsheet
-    """
-    def save_excel(self):
+    def saveExcel(self):
+        """
+        Creates and saves data to an Excel spreadsheet
+        """
         discard_sheet = None
         done_save = False
         while done_save == False:
@@ -1360,13 +1369,12 @@ class App(QMainWindow):
                 try:
                     done_save = True
                     self.workbook.save(f)
-                except PermissionError as e:
-                    debug_print(self.debug,e)
+                except PermissionError:
+                    self.logger.debug("Permission Error: Cannot save", exc_info=True)
                     QMessageBox.critical(self,"Error","Cannot save.\nThis can be caused by one of the following:\n1. You do not have access to the folder.\n2. You are replacing the file but it is still open.")
                     done_save = False
-                except Exception as e:
-                    debug_print(self.debug,"Unable to save file:")
-                    debug_print(self.debug,e)
+                except Exception:
+                    self.logger.debug("Unable to save file:", exc_info=True)
                     done_save = False
                 finally:
                     if done_save:
@@ -1383,36 +1391,68 @@ class App(QMainWindow):
                         self.started_threads = None
 
 if __name__ == '__main__':
+    logger = logging.getLogger()
+    handler = logging.StreamHandler()
+    logger.addHandler(handler)
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    file_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+    handler.setFormatter(formatter)
+    
 
     ico_path = ""
     try:
-        if hasattr(sys,'frozen'):
-            ico_path = sys.executable
-        else:
-            ico_path = sys.argv[0]
-
+        ico_path = sys._MEIPASS
+    except:
+        ico_path = sys.argv[0]
+    try:
         if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info'):
             os.makedirs(os.getenv("APPDATA") + '\\Computer Info')
+    except Exception:
+        logger.exception("Issue creating Computer Info directory")
+
+    try:
         if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg'):
-            copyfile(os.path.dirname(ico_path) + '\\multi_comp_settings.cfg',os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg')
+            copyfile(os.path.dirname(ico_path) + '\\multi_comp_settings.cfg',
+                     os.getenv("APPDATA") + '\\Computer Info\\multi_comp_settings.cfg')
+    except Exception:
+        logger.exception("Issue copying multi_comp_settings.cfg")
+
+    try:
         if not os.path.exists(os.getenv("APPDATA") + '\\Computer Info\\other_applications.prg'):
-            copyfile(os.path.dirname(ico_path) + '\\other_applications.prg',os.getenv("APPDATA") + '\\Computer Info\\other_applications.prg')
-    except Exception as e: print(e)
+            copyfile(os.path.dirname(ico_path) + '\\other_applications.prg',
+                     os.getenv("APPDATA") + '\\Computer Info\\other_applications.prg')
+    except Exception:
+        logger.exception("Issue copying other_applications.prg")
+
+    file_handler = logging.FileHandler(os.getenv("APPDATA") + '\\Computer Info\\comp_info.log',mode='w')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
 
     wind = QApplication(sys.argv)
 
     parser = argparse.ArgumentParser(description="Find computers, install apps, etc.")
 
-    parser.add_argument('-timeout',type=int,help="Set timeout for each PC. If computer info not found or program not installed in specified time (seconds) computer is skipped.")
+    parser.add_argument('-timeout', type=int, help="Set timeout for each PC. If computer info not found or program not installed in specified time (seconds) computer is skipped.")
     parser.add_argument('-debug', default=False, action='store_true')
     parser.add_argument('-verbose', default=False, action='store_true')
     args = parser.parse_args()
 
-    if args.timeout:
-        print("Timeout set to %ss" % (args.timeout))
-
     if not ctypes.windll.UxTheme.IsThemeActive():
         wind.setStyle('Fusion')
 
-    app = App(debug=args.debug,verbose=args.verbose,timeout=args.timeout,main_wind=wind)
+    file_handler.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
+
+    if args.debug:
+        handler.setLevel(logging.DEBUG)
+    elif args.verbose:
+        handler.setLevel(logging.INFO)
+    else:
+        handler.setLevel(logging.WARNING)
+
+    if args.timeout:
+        logger.info("Timeout set to %ss" % (args.timeout))
+
+    app = App(timeout=args.timeout,main_wind=wind,logger=logger)
     sys.exit(wind.exec_())
