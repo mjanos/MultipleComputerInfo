@@ -26,6 +26,8 @@ import argparse
 from urllib import request
 import logging
 from functools import partial
+import pythoncom
+from pathlib import Path
 
 try:
     from win10toast import ToastNotifier
@@ -55,9 +57,30 @@ class GuiThreadClass(QObject):
     def run(self):
         self.callback(*self.args,**self.kwargs)
 
+class WorkThreadClass(QObject):
+    started = pyqtSignal()
+    finished = pyqtSignal()
+
+    def __init__(self, q, cancel_bool, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.q = q
+        self.cancel_bool = cancel_bool
+        super().__init__()
+
+    @pyqtSlot()
+    def run(self):
+        while not self.q.empty():
+            if not self.cancel_bool.get():
+                pythoncom.CoInitialize()
+                self.q.get()(*self.args, **self.kwargs)
+                pythoncom.CoUninitialize()
+            else:
+                self.q.get()
+
 class App(QMainWindow):
 
-    def __init__(self,parent=None,timeout=None,main_wind=None,logger=None):
+    def __init__(self,parent=None,timeout=None,main_wind=None,logger=None, icon=None):
         super().__init__()
 
         self.main_wind = main_wind
@@ -67,18 +90,16 @@ class App(QMainWindow):
         #takes json of programs and creates a check list
         self.other_applications = ProgramChoices(["other_applications.prg"],default_folder=os.getenv("APPDATA") + '\\Computer Info',default_filename='other_applications.prg')
 
-        self.q = queue.Queue()
         self.logger = logger
-        self.running = False
-        self.cancel_bool = ThreadSafeBool()
-        self.filling_done_bool = ThreadSafeBool()
         self.timeout = timeout
-        self.comp_info_objs = []
-        self.comp_obj_complete = {}
-        self.excel_row_printer_count = 0
-        self.table_row_printer_count = 0
+        self.icon = icon
+        
+        self.started_threads = []
         self.custom_user = ""
         self.custom_passwd = ""
+        self.running = False
+        self.info_queue = queue.Queue()
+        self.cancel_bool = ThreadSafeBool()
 
         #widgets
         self.innerframe = QTabWidget(parent=self)
@@ -87,8 +108,9 @@ class App(QMainWindow):
         self.showEditOptionsSidebar()
 
         self.logger.debug("********Running in Debug Mode********")
-        self.t = QThread()
-        self.t.start()
+        self.scan_thread = QThread()
+        self.scan_thread.start()
+        
 
     def createMainWidgets(self):
         self.setWindowTitle("Computer Info")
@@ -392,6 +414,9 @@ class App(QMainWindow):
         Enables and disables buttons while running or stopped and resets variables for new run
         """
         if not self.running:
+            self.comp_info_objs = []
+            self.excel_row_printer_count = 0
+            self.table_row_printer_count = 0
             self.comp_obj_complete = {}
             self.table_hide_btn.setEnabled(False)
             self.table_save_btn.setEnabled(False)
@@ -426,6 +451,8 @@ class App(QMainWindow):
             self.table_frame.show()
             self.start_time = time.time()
             self.running = True
+            del self.info_queue
+            self.info_queue = queue.Queue()
 
             try:
                 self.install_script_name = os.path.splitext(os.path.basename(self.app_file_form.filename))[0].title()[:30]
@@ -544,17 +571,20 @@ class App(QMainWindow):
         """
         Starts new threads for each computer up to the 'thread clusters' number specified in the settings.
         """
-        self.started_threads = []
-        while not self.threads.empty():
-            if self.running_threads.get() < int(self.settings.settings_dict.get('thread clusters',15)):
-                self.started_threads.append(self.threads.get().start())
-                self.running_threads.increment()
+        self.worker_threads = []
 
-            if self.cancel_bool.get():
-                while not self.threads.empty():
-                    self.threads.get()
-        self.filling_done_bool.setTrue()
-        self.started_threads = []
+        if not self.started_threads:
+            max_threads = int(self.settings.settings_dict.get('thread clusters',15))
+            for _ in range(0,max_threads):
+                self.started_threads.append(QThread())
+                self.started_threads[-1].start()
+
+        for st in self.started_threads:
+            self.worker_threads.append(WorkThreadClass(self.threads, self.cancel_bool))
+            self.worker_threads[-1].moveToThread(st)
+            self.worker_threads[-1].started.connect(self.worker_threads[-1].run)
+            self.worker_threads[-1].started.emit()
+            
 
     @pyqtSlot(int,int)
     def updateProgressBar(self,val,max_val):
@@ -755,9 +785,8 @@ class App(QMainWindow):
         if self.install_app_btn.isChecked() and not self.app_file_form.filename:
             QMessageBox.critical(self,"Installer Missing","Please choose a vbs file to apply to PCs")
             return
-        self.filling_done_bool.setFalse()
+
         self.threads = queue.Queue()
-        self.running_threads = ThreadSafeCounter()
         self.countdown = ThreadSafeCounter()
         self.count = ThreadSafeCounter()
 
@@ -778,7 +807,7 @@ class App(QMainWindow):
                 get_apps = self.find_apps_btn.isChecked(),
                 install_app = self.install_app_btn.isChecked(),
         )
-        self.wt.moveToThread(self.t)
+        self.wt.moveToThread(self.scan_thread)
         self.wt.started.connect(self.wt.run)
         self.wt.progress_update.connect(self.updateProgressBar)
         self.wt.configure_prog.connect(self.initializeProgressUI)
@@ -839,7 +868,7 @@ class App(QMainWindow):
                 self.summary['totals']['total computers'] += 1
                 self.comp_info_objs.append(
                     ComputerInfo(
-                        q=self.q,
+                        q=self.info_queue,
                         input_name=line.strip(),
                         count=self.threads.qsize(),
                         icon=icon,
@@ -863,15 +892,14 @@ class App(QMainWindow):
                         manual_pass = self.custom_passwd
                     )
                 )
-                t = WMIThread(target=self.comp_info_objs[-1].get_info,daemon=True)
-                self.threads.put(t)
+                #t = WMIThread(target=self.comp_info_objs[-1].get_info,daemon=True)
+                self.threads.put(self.comp_info_objs[-1].get_info)
 
         self.countdown.set(self.threads.qsize())
         self.count.set(self.threads.qsize())
 
         self.wt.configure_prog.emit(self.countdown.get())
-        queue_filler = threading.Thread(target=self.queueThreads,daemon=True)
-        queue_filler.start()
+        self.queueThreads()
 
         #Set queue timeout for computers that hang WMI
         if self.timeout:
@@ -901,16 +929,13 @@ class App(QMainWindow):
             temp_manual_app_dict = {}
             temp_checkbox_apps_dict = {}
             temp_checkbox_exes_dict = {}
-            temp_printers_dict = {}
             try:
                 if self.cancel_bool.get():
                     timeout = 0
 
-                item = self.q.get(timeout=timeout)
+                item = self.info_queue.get(timeout=timeout)
                 self.comp_obj_complete[item.count] = item
 
-                if item:
-                    self.running_threads.decrement()
                 self.workbook.set_working_sheet(self.computers_key)
                 if not item.status:
                     temp_dict = {"status":"Online",'name':item.name,'serial':item.serial,'model':item.model,'username':item.user,'os':item.os,'cpu':item.cpu,'memory':item.memory,'error':item.status,'monitors':str(item.monitors)}
@@ -1126,7 +1151,7 @@ class App(QMainWindow):
                                     temp_checkbox_apps_dict,
                                     temp_checkbox_exes_dict,
                                     )
-
+        #     w.stop()
         self.wt.complete_run.emit()
 
     def postToast(self):
@@ -1136,8 +1161,8 @@ class App(QMainWindow):
         if self.lock_toast.acquire(timeout=15):
             try:
                 toaster = ToastNotifier()
-                if global_icon_path and os.path.exists(global_icon_path):
-                    toaster.show_toast("Complete!","Scan/Install is complete.\n%s out of %s computers online" % (self.summary['totals']['success'],self.summary['totals']['total computers']),icon_path=global_icon_path,duration=10)
+                if self.icon and self.icon.exists():
+                    toaster.show_toast("Complete!","Scan/Install is complete.\n%s out of %s computers online" % (self.summary['totals']['success'],self.summary['totals']['total computers']),icon_path=self.icon,duration=10)
                 else:
                     toaster.show_toast("Complete!","Scan/Install is complete.",duration=10)
             except Exception: self.logger.debug("Failed showing notification", exc_info=True)
@@ -1454,5 +1479,5 @@ if __name__ == '__main__':
     if args.timeout:
         logger.info("Timeout set to %ss" % (args.timeout))
 
-    app = App(timeout=args.timeout,main_wind=wind,logger=logger)
+    app = App(timeout=args.timeout,main_wind=wind,logger=logger, icon=Path(ico_path).parent.joinpath("logo.ico"))
     sys.exit(wind.exec_())
