@@ -10,9 +10,9 @@ import traceback
 import ctypes
 from shutil import copyfile
 from collections import OrderedDict
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QAction, QLabel, QFormLayout,QBoxLayout, QVBoxLayout, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QProgressBar, QTabWidget, QFileDialog, QMessageBox, QScrollArea, QStatusBar, QDialog, QTableWidget, QTableWidgetItem, QSplitter, QSizePolicy, QMenu, QCheckBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QAction, QLabel, QFormLayout,QBoxLayout, QVBoxLayout, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QProgressBar, QTabWidget, QFileDialog, QMessageBox, QScrollArea, QStatusBar, QDialog, QTableWidget, QTableWidgetItem, QSplitter, QSizePolicy, QMenu, QCheckBox, QDateTimeEdit
 from PyQt5.QtGui import QFont, QBrush, QColor,QCursor
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, pyqtSlot
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, pyqtSlot, QDateTime
 from ComputerInfoSharedResources.CIForms import ShortcutCheckboxForm, AuthenticationForm, FileForm, AppsForm
 from ComputerInfoSharedResources.dynamic_forms.forms import DynamicForm
 from ComputerInfoSharedResources.dynamic_forms.models import DynamicModel
@@ -22,12 +22,17 @@ from ComputerInfoSharedResources.CITime import format_time
 from ComputerInfoSharedResources.CIStorage import ThreadSafeCounter, ThreadSafeBool
 from ComputerInfoSharedResources.CIWMI import ComputerInfo, WMIThread
 from ComputerInfoSharedResources.CICustomWidgets import CustomScrollBox
+from smtplib import SMTP_SSL, SMTP
+import getpass
+from email.mime.text import MIMEText
+from email.utils import formataddr
 import argparse
 from urllib import request
 import logging
 from functools import partial
 import pythoncom
 from pathlib import Path
+from datetime import datetime
 
 try:
     from win10toast import ToastNotifier
@@ -38,6 +43,21 @@ def safe_divide(x,y):
         return x/y
     else:
         return 0
+
+class TestThreadClass(QObject):
+    started = pyqtSignal()
+    send_update = pyqtSignal(int)
+    finished = pyqtSignal()
+
+    def __init__(self, callback, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.callback = callback
+        super().__init__()
+    
+    @pyqtSlot()
+    def run(self):
+        self.callback(*self.args, **self.kwargs)
 
 class GuiThreadClass(QObject):
 
@@ -98,6 +118,7 @@ class App(QMainWindow):
         self.custom_user = ""
         self.custom_passwd = ""
         self.running = False
+        self.execution_time = None
         self.info_queue = queue.Queue()
         self.cancel_bool = ThreadSafeBool()
 
@@ -110,6 +131,12 @@ class App(QMainWindow):
         self.logger.debug("********Running in Debug Mode********")
         self.scan_thread = QThread()
         self.scan_thread.start()
+
+        self.gui_work_thread = QThread()
+        self.gui_work_thread.start()
+
+        self.testthread = QThread()
+        self.testthread.start()
         
 
     def createMainWidgets(self):
@@ -121,6 +148,9 @@ class App(QMainWindow):
         self.other_credentials_button = QAction('Other Credentials', self)
         self.other_credentials_button.triggered.connect(self.getCredentials)
         self.file_menu.addAction(self.other_credentials_button)
+        self.schedule_button = QAction("Delay Runtime", self)
+        self.schedule_button.triggered.connect(self.getDelay)
+        self.file_menu.addAction(self.schedule_button)
         self.exit_button = QAction('Exit', self)
         self.exit_button.setShortcut('Ctrl+Q')
         self.exit_button.triggered.connect(self.close)
@@ -168,7 +198,7 @@ class App(QMainWindow):
 
         about = QAction('About', self)
         about.triggered.connect(
-            partial(QMessageBox.information, self, "About", "Computer Info\nVersion 2.1"))
+            partial(QMessageBox.information, self, "About", "Computer Info\nVersion 2.3"))
         self.help_menu.addAction(about)
 
         self.containerWidget = QWidget()
@@ -194,9 +224,16 @@ class App(QMainWindow):
         self.col_one.setLayout(self.col_one_layout)
         self.title_label = QLabel(
             "Input a list of computers to get details", self.col_one)
+        self.subtitle_label = QLabel("", self.col_one)
         font = QFont()
         font.setPointSize(16)
         self.title_label.setFont(font)
+        font2 = QFont()
+        font2.setPointSize(10)
+        self.subtitle_label.setFont(font2)
+
+        self.waitingbox = QLabel(self.col_one)
+        self.waitingbox.setFont(font)
 
         self.inbox = QPlainTextEdit(self.col_one)
 
@@ -243,7 +280,7 @@ class App(QMainWindow):
         self.table_frame.hide()
 
         self.run_button = QPushButton('Start', self.col_one)
-        self.run_button.clicked.connect(self.startScan)
+        self.run_button.clicked.connect(self.startScanFacilitator)
         self.run_button.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Minimum)
 
@@ -270,10 +307,14 @@ class App(QMainWindow):
         self.running_frame_layout.addWidget(self.cancelbtn)
 
         self.col_one_layout.addWidget(self.title_label)
+        self.col_one_layout.addWidget(self.subtitle_label)
+        self.col_one_layout.addWidget(self.waitingbox)
         self.col_one_layout.addWidget(self.inbox)
         self.col_one_layout.addLayout(self.start_layout)
         self.col_one_layout.addWidget(self.running_frame)
         self.title_label.setAlignment(Qt.AlignCenter)
+        self.subtitle_label.setAlignment(Qt.AlignCenter)
+        self.waitingbox.setAlignment(Qt.AlignCenter)
 
         self.split = QHBoxLayout()
         self.split.addWidget(self.col_one)
@@ -311,10 +352,13 @@ class App(QMainWindow):
 
         self.apps_form = AppsForm(programs_obj=self.other_applications)
         self.find_apps_tab.setWidget(self.apps_form)
+        
 
         self.app_file_form = FileForm(
             extensionsallowed="VBScript, Powershell Script, Python Script (*.vbs *.ps1 *.py)", title="Choose Script File")
         self.install_app_tab_layout.addWidget(self.app_file_form)
+        self.app_file_form.form_change.connect(self.get_extra_parameters)
+
 
         self.show()
         self.innerframe.show()
@@ -387,19 +431,74 @@ class App(QMainWindow):
         top_layout = QVBoxLayout()
         top.setLayout(top_layout)
         settings_form = QFormLayout()
-        usernamefield=QLineEdit(self.custom_user)
-        passwordfield=QLineEdit(self.custom_passwd)
+        usernamefield = QLineEdit(self.custom_user)
+        passwordfield = QLineEdit(self.custom_passwd)
         passwordfield.setEchoMode(QLineEdit.Password)
         submitbtn = QPushButton("Submit")
-        settings_form.addRow("Username",usernamefield)
-        settings_form.addRow("Password",passwordfield)
+        settings_form.addRow("Username", usernamefield)
+        settings_form.addRow("Password", passwordfield)
         settings_form.addRow(submitbtn)
-        submitbtn.clicked.connect(partial(self.setCredentials,usernamefield,passwordfield,top))
-        
+        submitbtn.clicked.connect(partial(self.setCredentials, usernamefield, passwordfield, top))
+
         top_layout.addLayout(settings_form)
         top_layout.setAlignment(settings_form, Qt.AlignTop)
         top.show()
         top.activateWindow()
+
+    def getDelay(self):
+        top = QDialog(self)
+        top.setWindowTitle("Enter Credentials")
+        top.setSizeGripEnabled(True)
+        top_layout = QVBoxLayout()
+        top.setLayout(top_layout)
+        settings_form = QVBoxLayout()
+        datetimefield = QDateTimeEdit()
+        if self.execution_time:
+            datetimefield.setDateTime(self.execution_time)
+        datetimefield.setMinimumDateTime(QDateTime.currentDateTime())
+        submitbtn = QPushButton("Submit")
+        settings_form.addWidget(datetimefield)
+        settings_form.addWidget(submitbtn)
+        submitbtn.clicked.connect(partial(self.printDT,datetimefield,top))
+
+        top_layout.addLayout(settings_form)
+        top_layout.setAlignment(settings_form, Qt.AlignTop)
+        top.show()
+        top.activateWindow()
+
+    def printDT(self, val, top):
+        self.execution_time = val.dateTime()
+        self.subtitle_label.setText("Delay set to %s" % self.execution_time.toString("MM/dd/yyyy h:mm ap"))
+        top.close()
+
+    def countdownTime(self):
+        cur = QDateTime.currentDateTime()
+        timedelta = cur.secsTo(self.execution_time)
+        while timedelta > 0 and not self.cancel_bool.get():
+            self.testworker.send_update.emit(timedelta)
+            cur = QDateTime.currentDateTime()
+            timedelta = cur.secsTo(self.execution_time)
+            QThread.sleep(1)
+        if timedelta <= 0 or self.cancel_bool.get():
+            self.testworker.finished.emit()
+
+    @pyqtSlot(int)
+    def updateTimeLabel(self, secs):
+        hours, remainder = divmod(secs, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_string = ""
+        if hours > 0:
+            time_string = time_string + "%dh " % hours
+        if minutes > 0:
+            time_string = time_string + "%dm " % minutes
+        else:
+            if hours > 0:
+                time_string = time_string + "%dm " % minutes
+        time_string = time_string + "%ds" % seconds
+        self.waitingbox.setText("%s until execution\n(%s)" % (time_string, self.execution_time.toString("MM/dd/yyyy h:mm ap")))
+        self.counterbox.showMessage("%s until execution (%s)" % (time_string, self.execution_time.toString("MM/dd/yyyy h:mm ap")))
+
+        
 
     def singleCompAppHook(self,row,col):
         """
@@ -422,9 +521,11 @@ class App(QMainWindow):
             self.table_save_btn.setEnabled(False)
             self.cancelbtn.setEnabled(True)
             self.run_button.setEnabled(False)
+            self.run_button.show()
             self.inbox.setEnabled(False)
             self.options_menu.setEnabled(False)
             self.table_unavailable_btn.setEnabled(False)
+            self.table_unavailable_btn.show()
             self.check_form.form_disable()
             self.shortcut_file_form.form_disable()
             self.apps_form.form_disable()
@@ -464,18 +565,33 @@ class App(QMainWindow):
 
         else:
             self.table_hide_btn.setEnabled(True)
-            
+            self.waitingbox.hide()
+            self.subtitle_label.show()
+            self.subtitle_label.setText("")
             self.end_time = time.time()
             self.cancelbtn.setEnabled(False)
             self.run_button.setEnabled(True)
+            self.run_button.show()
             self.inbox.setEnabled(True)
             self.options_menu.setEnabled(True)
             self.table_unavailable_btn.setEnabled(True)
+            self.table_unavailable_btn.show()
             self.check_form.form_enable()
             self.shortcut_file_form.form_enable()
             self.apps_form.form_enable()
             self.app_file_form.form_enable()
             self.running = False
+            self.execution_time = None
+
+    def setWaitingState(self):
+        """
+        Shows waiting information
+        """
+        self.waitingbox.show()
+        self.inbox.hide()
+        self.subtitle_label.hide()
+        self.run_button.hide()
+        self.table_unavailable_btn.hide()
 
     def getCheckboxApps(self):
         """
@@ -503,7 +619,7 @@ class App(QMainWindow):
         """
         self.table_tabs.clear()
         self.table_tabs.addTab(self.table1,"Computers")
-        self.main_columns = ["Status","Name","IP Address","Serial","Model","Username","OS","Resolution","Monitors","CPU","Memory","Error","Profile Time"]
+        self.main_columns = ["Status","Name","IP Address","Serial","Model","Username","OS","Resolution","Monitors","CPU","Memory","Error","Profile Time", "Time Completed"]
         self.table1.setColumnCount(len(self.main_columns))
         self.table1.setHorizontalHeaderLabels(self.main_columns)
 
@@ -572,12 +688,29 @@ class App(QMainWindow):
         Starts new threads for each computer up to the 'thread clusters' number specified in the settings.
         """
         self.worker_threads = []
+        max_threads = int(self.settings.settings_dict.get('thread clusters', 0))
+        if not max_threads:
+            max_threads = QThread.idealThreadCount()
+            
+        self.logger.debug("Starting up %s threads" % max_threads)
 
         if not self.started_threads:
-            max_threads = int(self.settings.settings_dict.get('thread clusters',15))
             for _ in range(0,max_threads):
                 self.started_threads.append(QThread())
                 self.started_threads[-1].start()
+
+        # if len(self.started_threads) < max_threads:
+        #     for _ in range(0,max_threads-len(self.started_threads)):
+        #         self.started_threads.append(QThread())
+        #         self.started_threads[-1].start()
+
+        # elif len(self.started_threads) > max_threads:
+        #     for st in self.started_threads[max_threads:]:
+        #         st.quit()
+        #         del st
+        #     del self.started_threads[max_threads:]
+        #     print("gt Threads: %s" % len(self.started_threads))
+
 
         for st in self.started_threads:
             self.worker_threads.append(WorkThreadClass(self.threads, self.cancel_bool))
@@ -585,6 +718,23 @@ class App(QMainWindow):
             self.worker_threads[-1].started.connect(self.worker_threads[-1].run)
             self.worker_threads[-1].started.emit()
             
+    @pyqtSlot(str)
+    def get_extra_parameters(self, script_file):
+        self.app_file_form.remove_fields()
+        if str(script_file).endswith(".py"):
+            line = ""
+            with open(script_file,"r") as f:
+                line = f.readline()
+            if line.startswith("\""):
+                all_split = re.split(r';', line.replace("\"","").strip())
+                self.extra_parameters = all_split
+                for param in self.extra_parameters:
+                    self.app_file_form.add_field(param)
+            else:
+                self.extra_parameters = []
+        else:
+            self.extra_parameters = []
+
 
     @pyqtSlot(int,int)
     def updateProgressBar(self,val,max_val):
@@ -675,6 +825,7 @@ class App(QMainWindow):
         Then posts a toast notification that the application has completed on all hosts.
         """
         self.toggleRunningState()
+        
         self.fixBlanks()
         temp_t = threading.Thread(target=self.postToast,daemon=True)
         temp_t.start()
@@ -774,16 +925,53 @@ class App(QMainWindow):
             if self.find_apps_installs_table.rowCount():
                 self.find_apps_installs_table.setRowHidden(row,True)
 
+    def startScanFacilitator(self):        
+        self.waitingbox.show()
+        self.subtitle_label.hide()
+
+        self.toggleRunningState()
+        if self.cancel_bool.get():
+            self.toggleRunningState()
+            self.restoreInputBox()
+            self.cancel_bool.setFalse()
+            self.cancelbtn.setText("Cancel")
+            return
+
+        if self.push_shortcut_btn.isChecked() and not self.shortcut_file_form.filename:
+            QMessageBox.critical(self, "Icon File Missing", "Please choose an icon file to push")
+            self.toggleRunningState()
+            self.restoreInputBox()
+            return
+        if self.install_app_btn.isChecked() and not self.app_file_form.filename:
+            QMessageBox.critical(self, "Installer Missing", "Please choose a vbs file to apply to PCs")
+            self.toggleRunningState()
+            self.restoreInputBox()
+            return
+
+        if self.execution_time:
+            self.setWaitingState()
+            self.table_frame.hide()
+            self.testworker = TestThreadClass(self.countdownTime)
+            self.testworker.moveToThread(self.testthread)
+            self.testworker.started.connect(self.testworker.run)
+            self.testworker.send_update.connect(self.updateTimeLabel)
+            self.testworker.finished.connect(self.startScan)
+            self.testworker.started.emit()
+        else:
+            self.startScan()
+            
+
     def startScan(self):
         """
         Activated by pressing start button. Creates a GUIThreadClass Object with all necessary options.
         Connects thread to signals to change UI after each PC completes.
         """
-        if self.push_shortcut_btn.isChecked() and not self.shortcut_file_form.filename:
-            QMessageBox.critical(self,"Icon File Missing","Please choose an icon file to push")
-            return
-        if self.install_app_btn.isChecked() and not self.app_file_form.filename:
-            QMessageBox.critical(self,"Installer Missing","Please choose a vbs file to apply to PCs")
+        self.table_frame.show()
+        if self.cancel_bool.get():
+            self.toggleRunningState()
+            self.restoreInputBox()
+            self.cancel_bool.setFalse()
+            self.cancelbtn.setText("Cancel")
             return
 
         self.threads = queue.Queue()
@@ -791,8 +979,7 @@ class App(QMainWindow):
         self.count = ThreadSafeCounter()
 
         self.master_pc_list = []
-
-        self.toggleRunningState()
+        
         self.setTableColumns()
 
         self.wt = GuiThreadClass(self.getComputerNames,
@@ -849,8 +1036,10 @@ class App(QMainWindow):
         self.computers_key = self.workbook.new_sheet("Computers",columns=self.main_columns)
         self.summary['totals']['success'] = 0
 
+        extra_parameters = []
         if install_app:
             single_app_install = self.app_file_form.filename
+            extra_parameters = self.app_file_form.get_field_list()
         else:
             single_app_install = None
 
@@ -885,6 +1074,7 @@ class App(QMainWindow):
                         other_applications = self.chosen_apps,
                         install_applications = self.chosen_executes,
                         single_app_install = single_app_install,
+                        extra_parameters = extra_parameters,
                         get_printers = get_printers,
                         logger = self.logger,
                         profile = True,
@@ -948,6 +1138,8 @@ class App(QMainWindow):
 
                     if item.profile_time:
                         temp_dict['profile time'] = "%.2f seconds" % item.profile_time
+
+                    temp_dict['time completed'] = datetime.now()
 
                     self.workbook.working_sheet.add_row(temp_dict,row=item.count+2)
                     self.summary['totals']['success'] += 1
@@ -1216,6 +1408,7 @@ class App(QMainWindow):
         """
         Used to hide rows where the computer was "Unavailable"
         """
+        self.table_unavailable_btn.setEnabled(False)
         if stateval:
             hide_row = True
         else:
@@ -1253,6 +1446,7 @@ class App(QMainWindow):
             for r in range(0,self.find_apps_installs_table.rowCount()+1):
                 if not self.find_apps_installs_table.item(r,0) or self.find_apps_installs_table.item(r,0) and self.find_apps_installs_table.item(r,0).text() != "Online":
                     self.find_apps_installs_table.setRowHidden(r,hide_row)
+        self.table_unavailable_btn.setEnabled(True)
 
     def manualInstallOutput(self, row, col):
         """
@@ -1349,7 +1543,7 @@ class App(QMainWindow):
 
     def setSummary(self):
         """
-        Saves spreadsheet to file with dialog
+        Create table of success numbers
         """
         self.workbook.set_working_sheet(self.summary_key)
 
@@ -1377,6 +1571,32 @@ class App(QMainWindow):
 
         if self.install_app_btn.isChecked():
             self.workbook.working_sheet.add_grouping("Installs",*install_status_args)
+
+        smtp_thread = threading.Thread(target=lambda:self.send_smtp(['mjanos@wphospital.org', 'wpinventory@wphospital.org'], "Scan Complete!<br>Success: %s (%.2f%%)<br>Failure: %s (%.2f%%)" % (self.summary['totals']['success'], success_percent*100, self.summary['totals']['total computers']-self.summary['totals']['success'], failure_percent*100)))
+        smtp_thread.start()        
+
+    def send_smtp(self, recipients, content):
+        send_from = 'ComputerInfo@wphospital.org'
+        try:
+            S = SMTP('wphospital-org.mail.protection.outlook.com', 25)
+            #S.set_debuglevel(1)
+            S.connect('wphospital-org.mail.protection.outlook.com',25)
+            S.ehlo()
+            try:
+                S.starttls()
+            except:
+                self.logger.debug("No support for starttls")
+            S.ehlo()
+            #S.login("mjanos@wphospital.org", getpass.getpass("Input password for mjanos: "))
+            msg = MIMEText(content.encode('utf-8'), 'html', 'UTF-8')
+            msg['Subject'] = "Run Complete"
+            msg['From'] = formataddr(('ComputerInfo', send_from))
+            msg['Content-Type'] = "text/html; charset=utf-8"
+            msg['to'] = ";".join(recipients)
+            S.sendmail(send_from,";".join(recipients),msg.as_string())
+            S.quit()
+        except Exception as e:
+            raise
 
     def saveExcel(self):
         """
@@ -1413,7 +1633,6 @@ class App(QMainWindow):
                         if not final_secs.strip() and not final_mins.strip() and not final_hours.strip(): final_secs = "less than a second"
                         open_excel = QMessageBox.question(self,"Open File", "Report completed in %s%s%s\nOpen the saved Excel Spreadsheet?" % (final_hours,final_mins,final_secs))
                         if open_excel == QMessageBox.Yes: os.startfile(f.replace("\\","\\\\").replace("/","\\"))
-                        self.started_threads = None
 
 if __name__ == '__main__':
     logger = logging.getLogger()
