@@ -24,7 +24,10 @@ from ComputerInfoSharedResources.CIWMI import ComputerInfo, WMIThread
 from ComputerInfoSharedResources.CICustomWidgets import CustomScrollBox
 from smtplib import SMTP_SSL, SMTP
 import getpass
+from email import encoders
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.message import EmailMessage
 from email.utils import formataddr
 import argparse
 from urllib import request
@@ -113,6 +116,7 @@ class App(QMainWindow):
         self.logger = logger
         self.timeout = timeout
         self.icon = icon
+        self.emails = ""
         
         self.started_threads = []
         self.custom_user = ""
@@ -279,10 +283,13 @@ class App(QMainWindow):
 
         self.table_frame.hide()
 
+        self.email_field = QLineEdit(self.col_one)
+        self.email_field.setPlaceholderText("Email address to send report to (Separate by ;)")
+        self.email_field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
         self.run_button = QPushButton('Start', self.col_one)
         self.run_button.clicked.connect(self.startScanFacilitator)
-        self.run_button.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
         self.table_unavailable_btn = QCheckBox(
             "Hide 'Unavailable'", self.col_one)
@@ -310,6 +317,7 @@ class App(QMainWindow):
         self.col_one_layout.addWidget(self.subtitle_label)
         self.col_one_layout.addWidget(self.waitingbox)
         self.col_one_layout.addWidget(self.inbox)
+        self.col_one_layout.addWidget(self.email_field)
         self.col_one_layout.addLayout(self.start_layout)
         self.col_one_layout.addWidget(self.running_frame)
         self.title_label.setAlignment(Qt.AlignCenter)
@@ -523,6 +531,7 @@ class App(QMainWindow):
             self.run_button.setEnabled(False)
             self.run_button.show()
             self.inbox.setEnabled(False)
+            self.email_field.setEnabled(False)
             self.options_menu.setEnabled(False)
             self.table_unavailable_btn.setEnabled(False)
             self.table_unavailable_btn.show()
@@ -573,6 +582,7 @@ class App(QMainWindow):
             self.run_button.setEnabled(True)
             self.run_button.show()
             self.inbox.setEnabled(True)
+            self.email_field.setEnabled(True)
             self.options_menu.setEnabled(True)
             self.table_unavailable_btn.setEnabled(True)
             self.table_unavailable_btn.show()
@@ -582,6 +592,7 @@ class App(QMainWindow):
             self.app_file_form.form_enable()
             self.running = False
             self.execution_time = None
+
 
     def setWaitingState(self):
         """
@@ -947,6 +958,16 @@ class App(QMainWindow):
             self.toggleRunningState()
             self.restoreInputBox()
             return
+
+        self.emails = self.email_field.text()
+        if self.emails:
+            if not re.match(r"([\w\-_]+@[\w\-_]+.[\w]+;)*([\w\-_]+@[\w\-_]+.[\w]+[;]*)$",self.emails):
+                QMessageBox.critical(self, "Invalid Email Addresses", "Please check your email addresses. There may be an invalid character.")
+                self.toggleRunningState()
+                self.restoreInputBox()
+                return
+        
+
 
         if self.execution_time:
             self.setWaitingState()
@@ -1572,8 +1593,9 @@ class App(QMainWindow):
         if self.install_app_btn.isChecked():
             self.workbook.working_sheet.add_grouping("Installs",*install_status_args)
 
-        smtp_thread = threading.Thread(target=lambda:self.send_smtp(['mjanos@wphospital.org', 'wpinventory@wphospital.org'], "Scan Complete!<br>Success: %s (%.2f%%)<br>Failure: %s (%.2f%%)" % (self.summary['totals']['success'], success_percent*100, self.summary['totals']['total computers']-self.summary['totals']['success'], failure_percent*100)))
-        smtp_thread.start()        
+        if self.emails:
+            smtp_thread = threading.Thread(target=lambda:self.send_smtp(self.emails, "Scan Complete!<br>Success: %s (%.2f%%)<br>Failure: %s (%.2f%%)" % (self.summary['totals']['success'], success_percent*100, self.summary['totals']['total computers']-self.summary['totals']['success'], failure_percent*100)))
+            smtp_thread.start()        
 
     def send_smtp(self, recipients, content):
         send_from = 'ComputerInfo@wphospital.org'
@@ -1588,12 +1610,20 @@ class App(QMainWindow):
                 self.logger.debug("No support for starttls")
             S.ehlo()
             #S.login("mjanos@wphospital.org", getpass.getpass("Input password for mjanos: "))
-            msg = MIMEText(content.encode('utf-8'), 'html', 'UTF-8')
+            msg = EmailMessage()
             msg['Subject'] = "Run Complete"
             msg['From'] = formataddr(('ComputerInfo', send_from))
             msg['Content-Type'] = "text/html; charset=utf-8"
-            msg['to'] = ";".join(recipients)
-            S.sendmail(send_from,";".join(recipients),msg.as_string())
+            msg['to'] = recipients
+            msg.set_content(content, subtype='html')
+            msg.make_mixed()
+            self.workbook.save("C:\\windows\\temp\\report.xlsx")
+            part = MIMEBase('application','octet-stream')
+            part.set_payload(open("C:\\windows\\temp\\report.xlsx","rb").read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment; filename="report.xlsx"')
+            msg.attach(part)
+            S.sendmail(send_from,recipients,msg.as_string())
             S.quit()
         except Exception as e:
             raise
