@@ -1065,12 +1065,18 @@ class App(QMainWindow):
             single_app_install = None
 
         #expand fullbox with subnets here
+        expandable_entries = []
         for i,l in enumerate(fullbox):
             pattern = re.compile(r'^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$')
             pmatch = pattern.match(l.strip())
             if pmatch:
                 self.logger.debug("Found match for %s" % l.strip())
-                fullbox = fullbox[:i] + [str(t) for t in ipaddress.IPv4Network(l.strip()).hosts()] + fullbox[i+1:]
+                expandable_entries.append(l.strip())
+        for x in expandable_entries:
+            i = fullbox.index(x)
+            fullbox = fullbox[:i] + [str(t) for t in ipaddress.IPv4Network(x).hosts()] + fullbox[i+1:]
+
+
 
         for line in fullbox:
             if line.strip() != "":
@@ -1623,7 +1629,8 @@ class App(QMainWindow):
             encoders.encode_base64(part)
             part.add_header('Content-Disposition', 'attachment; filename="report.xlsx"')
             msg.attach(part)
-            S.sendmail(send_from,recipients,msg.as_string())
+            recipient_list = recipients.split(";")
+            S.sendmail(send_from,recipient_list,msg.as_string())
             S.quit()
         except Exception as e:
             raise
