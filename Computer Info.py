@@ -967,8 +967,6 @@ class App(QMainWindow):
                 self.restoreInputBox()
                 return
         
-
-
         if self.execution_time:
             self.setWaitingState()
             self.table_frame.hide()
@@ -1075,8 +1073,6 @@ class App(QMainWindow):
         for x in expandable_entries:
             i = fullbox.index(x)
             fullbox = fullbox[:i] + [str(t) for t in ipaddress.IPv4Network(x).hosts()] + fullbox[i+1:]
-
-
 
         for line in fullbox:
             if line.strip() != "":
